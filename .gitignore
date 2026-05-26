@@ -1,0 +1,49 @@
+# ── Python ──
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ── Jupyter ──
+.ipynb_checkpoints/
+
+# ── Environment ──
+.venv/
+venv/
+env/
+*.env
+
+# ── Data ──
+data/*.fif
+data/*.fif.gz
+data/*.set
+data/*.edf
+data/*.bdf
+data/*.vhdr
+data/*.eeg
+data/*.cnt
+data/*.egi
+data/*.mff
+data/*.fdt
+data/*.vmrk
+data/openneuro_eeg/
+
+# ── Logs ──
+logs/
+*.log
+
+# ── IDE ──
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── OS ──
+.DS_Store
+Thumbs.db
+
+# ── Claude ──
+.claude/
