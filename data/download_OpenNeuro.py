@@ -44,6 +44,12 @@ from typing import Optional
 import requests
 
 GRAPHQL_URL = "https://openneuro.org/crn/graphql"
+GRAPHQL_HEADERS = {
+    "Content-Type": "application/json",
+    "Origin": "https://openneuro.org",
+    "Referer": "https://openneuro.org/",
+    "User-Agent": "EEG-FM-data-prep/0.1",
+}
 PAGE_SIZE = 100
 
 
@@ -108,19 +114,50 @@ class AtomicTracker:
 # GraphQL 查询
 # ──────────────────────────────────────────────────────────────────────
 
-def query_graphql(query: str, timeout: int = 30) -> dict:
-    try:
-        resp = requests.post(
-            GRAPHQL_URL,
-            json={"query": query},
-            headers={"Content-Type": "application/json"},
-            timeout=timeout,
-        )
-        resp.raise_for_status()
-        return resp.json()
-    except Exception as e:
-        print(f"[ERROR] GraphQL 失败: {e}", file=sys.stderr)
-        return {}
+def query_graphql(
+    query: str,
+    timeout: int = 30,
+    retries: int = 5,
+    backoff_sec: float = 2.0,
+) -> dict:
+    """Run an OpenNeuro GraphQL query with retry.
+
+    OpenNeuro occasionally closes HTTPS connections mid-page. Returning a
+    partial dataset list is worse than failing loudly, so callers validate that
+    a complete page payload is present before continuing.
+    """
+    last_error: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            resp = requests.post(
+                GRAPHQL_URL,
+                json={"query": query},
+                headers=GRAPHQL_HEADERS,
+                timeout=timeout,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            errors = payload.get("errors")
+            if errors and not payload.get("data"):
+                message = errors[0].get("message", errors[0])
+                raise RuntimeError(f"GraphQL returned errors: {message}")
+            return payload
+        except Exception as e:
+            last_error = e
+            if attempt < retries:
+                wait = backoff_sec * attempt
+                print(
+                    f"[WARN] GraphQL 失败 ({attempt}/{retries}): {e}; "
+                    f"{wait:.1f}s 后重试",
+                    file=sys.stderr,
+                )
+                time.sleep(wait)
+
+    print(
+        f"[ERROR] GraphQL 失败 ({retries}/{retries}): {last_error}",
+        file=sys.stderr,
+    )
+    return {}
 
 
 def fetch_all_eeg() -> list[EegDataset]:
@@ -149,11 +186,16 @@ def fetch_all_eeg() -> list[EegDataset]:
         }}
         """
         result = query_graphql(q)
-        if "data" not in result:
-            break
+        datasets_payload = result.get("data", {}).get("datasets")
+        if datasets_payload is None:
+            cursor_str = cursor or "start"
+            raise RuntimeError(
+                "OpenNeuro 数据集分页查询未完成: "
+                f"cursor={cursor_str}, 已收集={len(seen)}"
+            )
 
-        edges = result["data"]["datasets"]["edges"]
-        page_info = result["data"]["datasets"]["pageInfo"]
+        edges = datasets_payload["edges"]
+        page_info = datasets_payload["pageInfo"]
 
         for e in edges:
             n = e["node"]
@@ -493,7 +535,11 @@ def main():
 
     # ── 查询 ──────────────────────────────────────────────────────
     print("[1/4] 正在查询 OpenNeuro (modality=EEG) ...")
-    datasets = fetch_all_eeg()
+    try:
+        datasets = fetch_all_eeg()
+    except RuntimeError as e:
+        print(f"[ERROR] {e}", file=sys.stderr)
+        sys.exit(1)
     print(f"  -> 找到 {len(datasets)} 个 EEG 数据集\n")
     if not datasets:
         sys.exit(1)

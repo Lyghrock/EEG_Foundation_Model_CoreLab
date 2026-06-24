@@ -1,0 +1,14 @@
+# Core HTTP/download dependencies
+requests>=2.31
+openneuro-py>=2026.4.1
+
+# EEG I/O and preprocessing
+mne>=1.8
+numpy>=1.26
+scipy>=1.11
+pandas>=2.0
+
+# Optional readers used by MNE for common EEG container formats
+pymatreader>=1.0
+mffpy>=0.8
+h5py>=3.10

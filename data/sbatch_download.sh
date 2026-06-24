@@ -1,170 +1,256 @@
 #!/bin/bash
 # =============================================================================
-# sbatch_download.sh — 集群批量下载 OpenNeuro EEG 数据集
+# sbatch_download.sh - Generic Slurm launcher for EEG dataset downloads
 #
-# 用法:
-#   sbatch sbatch_download.sh                          # 启动任务
-#   sbatch sbatch_download.sh --dataset ds002778       # 只下载单个数据集
+# Usage examples:
+#   sbatch sbatch_download.sh
+#   sbatch sbatch_download.sh --dry-run
+#   DATA_SOURCE=physionet sbatch sbatch_download.sh
+#   DATA_SOURCE=openneuro MAX_SIZE_MB=102400 sbatch sbatch_download.sh --dataset ds002778
 #
-# 说明:
-#   - 不申请 GPU
-#   - 分配 N 个 CPU 核心用于并行下载 (由 --cpus-per-task 控制)
-#   - 下载完成后自动执行预处理压缩 (采样率对齐、通道对齐、长度对齐)
-#   - 输出日志到 logs/ 目录
+# Notes:
+#   - This launcher is intended for H100-style Slurm download jobs.
+#   - It does not pull/sync code. Put the target Python scripts in place first.
+#   - Edit the absolute paths in the configuration block before using another
+#     account or another machine.
+#   - Slurm #SBATCH log directives cannot use shell variables. Runtime logs are
+#     mirrored to LOG_DIR after the job starts.
 # =============================================================================
 
-#SBATCH --job-name=openneuro_eeg
-#SBATCH --output=logs/openneuro_eeg_%j.out
-#SBATCH --error=logs/openneuro_eeg_%j.err
+#SBATCH --job-name=eeg_download
+#SBATCH --output=slurm-%x-%j.out
+#SBATCH --error=slurm-%x-%j.err
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --time=72:00:00
 #SBATCH --gres=none
 
-# ============================================
-# 用户配置区域 (请根据实际情况修改 ↓)
-# ============================================
-CONDA_ENV="eeg_fm"
-OUTPUT_DIR="/mnt/ddn/weijun/EEG/"   # ← 修改为你的存储路径
+set -euo pipefail
 
-# ── 下载控制 ──────────────────────────────────
-MAX_SIZE_MB=1000                        # 下载上限 (MB), 0=不限
-MAX_WORKERS=8                             # 并行下载线程数 (<= CPUS_PER_TASK)
+# =============================================================================
+# User configuration - use absolute paths for H100 or other shared accounts.
+# Values can also be overridden at submission time, for example:
+#   DATA_SOURCE=physionet OUTPUT_DIR=/abs/data/path sbatch sbatch_download.sh
+# =============================================================================
 
-# ── 预处理对齐 ────────────────────────────────
-TARGET_FS=250                             # 目标采样率 (Hz)
-ALIGN_SFREQ=true                          # true=强制对齐所有文件到 TARGET_FS
-STANDARD_CHANNELS=""                      # 标准通道集 (逗号分隔, 空=不启用)
-                                          # 例: "Fp1,Fp2,F3,F4,C3,C4,P3,P4,O1,O2,F7,F8,T7,T8,P7,P8,Fz,Cz,Pz,FCz"
-TARGET_DURATION=""                        # 目标时长秒数 (空=不启用)
-LENGTH_MODE="crop"                        # 长度对齐模式: crop/truncate/pad
-INTERPOLATE_CHANNELS=false                # 是否插值缺失的标准通道
+# Dataset source selector. Supported: openneuro, physionet, custom.
+DATA_SOURCE="${DATA_SOURCE:-openneuro}"
 
-# ── 后处理 ────────────────────────────────────
-ENABLE_PREPROCESS=true                    # true=下载后自动预处理
-REMOVE_ORIGINAL=true                      # true=预处理后删除原始文件
-# ============================================
+case "${DATA_SOURCE}" in
+    openneuro)
+        DEFAULT_OUTPUT_DIR="/mnt/ddn/shared/datasets/eeg/OpenNeuro"
+        ;;
+    physionet)
+        DEFAULT_OUTPUT_DIR="/mnt/ddn/shared/datasets/eeg/PhysioNet"
+        ;;
+    custom)
+        DEFAULT_OUTPUT_DIR="/mnt/ddn/shared/datasets/eeg/custom"
+        ;;
+    *)
+        DEFAULT_OUTPUT_DIR="/mnt/ddn/shared/datasets/eeg/${DATA_SOURCE}"
+        ;;
+esac
 
-# 解析额外参数 (传递给 Python 脚本)
-EXTRA_ARGS="$@"
+# Absolute code paths.
+REPO_DIR="${REPO_DIR:-/home/weijun/Brain_FM/EEG_Foundation_Model_CoreLab}"
+OPENNEURO_SCRIPT="${OPENNEURO_SCRIPT:-${REPO_DIR}/data/download_OpenNeuro.py}"
+PHYSIONET_SCRIPT="${PHYSIONET_SCRIPT:-${REPO_DIR}/data/download_PhysioNet.py}"
+CUSTOM_DOWNLOAD_SCRIPT="${CUSTOM_DOWNLOAD_SCRIPT:-}"
 
-# 自动检测脚本路径:
-# 某些集群会把 sbatch 脚本复制到 spool 目录执行, 此时 BASH_SOURCE[0] 不可靠。
-# 因此优先使用提交目录, 并在候选目录中查找 down_EEG.py。
-SCRIPT_BASENAME="down_EEG.py"
-SCRIPT_DIR=""
+# Absolute storage/log paths.
+OUTPUT_DIR="${OUTPUT_DIR:-${DEFAULT_OUTPUT_DIR}}"
+LOG_DIR="${LOG_DIR:-${REPO_DIR}/logs/download}"
 
-CANDIDATES=()
-[ -n "${SLURM_SUBMIT_DIR}" ] && CANDIDATES+=("${SLURM_SUBMIT_DIR}")
-CANDIDATES+=("${PWD}")
-CANDIDATES+=("$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)")
+# Runtime environment. Set CONDA_ENV="" to skip conda activation.
+CONDA_ENV="${CONDA_ENV-eeg_fm}"
+CONDA_SH="${CONDA_SH:-}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+CHECK_IMPORTS="${CHECK_IMPORTS:-true}"
 
-for d in "${CANDIDATES[@]}"; do
-    if [ -f "${d}/${SCRIPT_BASENAME}" ]; then
-        SCRIPT_DIR="${d}"
-        break
+# Download controls shared by download_OpenNeuro.py and planned future scripts.
+MAX_SIZE_MB="${MAX_SIZE_MB:-0}"          # 0 means unlimited when supported.
+MAX_WORKERS="${MAX_WORKERS:-${SLURM_CPUS_PER_TASK:-8}}"
+DRY_RUN="${DRY_RUN:-false}"
+
+# Optional preprocessing flags. Disable for pure download jobs.
+ENABLE_PREPROCESS="${ENABLE_PREPROCESS:-false}"
+TARGET_FS="${TARGET_FS:-250}"
+ALIGN_SFREQ="${ALIGN_SFREQ:-true}"
+STANDARD_CHANNELS="${STANDARD_CHANNELS:-}"
+TARGET_DURATION="${TARGET_DURATION:-}"
+LENGTH_MODE="${LENGTH_MODE:-crop}"
+INTERPOLATE_CHANNELS="${INTERPOLATE_CHANNELS:-false}"
+REMOVE_ORIGINAL="${REMOVE_ORIGINAL:-true}"
+
+# =============================================================================
+
+is_true() {
+    case "$1" in
+        true|TRUE|True|1|yes|YES|Yes|y|Y) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+require_abs_path() {
+    local value="$1"
+    local name="$2"
+    if [ -z "${value}" ]; then
+        echo "[ERROR] ${name} is empty"
+        exit 1
     fi
-done
+    case "${value}" in
+        /*) ;;
+        *)
+            echo "[ERROR] ${name} must be an absolute path: ${value}"
+            exit 1
+            ;;
+    esac
+}
 
-if [ -z "${SCRIPT_DIR}" ]; then
-    echo "[ERROR] 未找到下载脚本: ${SCRIPT_BASENAME}"
-    echo "检查过的目录:"
-    for d in "${CANDIDATES[@]}"; do
-        echo "  - ${d}"
-    done
+select_download_script() {
+    case "${DATA_SOURCE}" in
+        openneuro)
+            DOWNLOAD_SCRIPT="${OPENNEURO_SCRIPT}"
+            REQUIRED_IMPORTS="import mne, openneuro, requests"
+            ;;
+        physionet)
+            DOWNLOAD_SCRIPT="${PHYSIONET_SCRIPT}"
+            REQUIRED_IMPORTS="import requests"
+            ;;
+        custom)
+            DOWNLOAD_SCRIPT="${CUSTOM_DOWNLOAD_SCRIPT}"
+            REQUIRED_IMPORTS=""
+            ;;
+        *)
+            echo "[ERROR] Unsupported DATA_SOURCE: ${DATA_SOURCE}"
+            echo "Supported values: openneuro, physionet, custom"
+            exit 1
+            ;;
+    esac
+}
+
+activate_conda() {
+    if [ -z "${CONDA_ENV}" ]; then
+        echo "[INFO] CONDA_ENV is empty; skipping conda activation"
+        return
+    fi
+
+    if [ -n "${CONDA_SH}" ]; then
+        require_abs_path "${CONDA_SH}" "CONDA_SH"
+        if [ ! -f "${CONDA_SH}" ]; then
+            echo "[ERROR] CONDA_SH does not exist: ${CONDA_SH}"
+            exit 1
+        fi
+        source "${CONDA_SH}"
+        conda activate "${CONDA_ENV}"
+        return
+    fi
+
+    if command -v conda >/dev/null 2>&1; then
+        eval "$(conda shell.bash hook)"
+        conda activate "${CONDA_ENV}"
+        return
+    fi
+
+    echo "[ERROR] Cannot activate conda env: ${CONDA_ENV}"
+    echo "Set CONDA_SH to an absolute conda.sh path, or set CONDA_ENV=\"\" to skip."
+    exit 1
+}
+
+print_command() {
+    printf "Running:"
+    printf " %q" "$@"
+    echo
+}
+
+select_download_script
+
+require_abs_path "${REPO_DIR}" "REPO_DIR"
+require_abs_path "${DOWNLOAD_SCRIPT}" "DOWNLOAD_SCRIPT"
+require_abs_path "${OUTPUT_DIR}" "OUTPUT_DIR"
+require_abs_path "${LOG_DIR}" "LOG_DIR"
+
+if [ ! -f "${DOWNLOAD_SCRIPT}" ]; then
+    echo "[ERROR] Download script not found: ${DOWNLOAD_SCRIPT}"
     exit 1
 fi
 
-SCRIPT="${SCRIPT_DIR}/${SCRIPT_BASENAME}"
+mkdir -p "${LOG_DIR}"
+RUN_ID="${SLURM_JOB_ID:-manual_$(date +%Y%m%d_%H%M%S)}"
+LOG_FILE="${LOG_DIR}/${DATA_SOURCE}_${RUN_ID}.log"
+exec > >(tee -a "${LOG_FILE}") 2>&1
 
-# 创建日志目录
-mkdir -p "${SCRIPT_DIR}/logs"
-
-# 打印集群信息
 echo "=========================================="
 echo "Job started at: $(date)"
 echo "Host: $(hostname)"
-echo "SLURM Job ID: ${SLURM_JOB_ID}"
-echo "CPU cores: ${SLURM_CPUS_PER_TASK:-8}"
-echo "Memory: ${SLURM_MEM:-32G}"
+echo "SLURM Job ID: ${SLURM_JOB_ID:-none}"
+echo "Data source: ${DATA_SOURCE}"
+echo "Download script: ${DOWNLOAD_SCRIPT}"
 echo "Output dir: ${OUTPUT_DIR}"
+echo "Log file: ${LOG_FILE}"
+echo "CPU cores: ${SLURM_CPUS_PER_TASK:-${MAX_WORKERS}}"
 echo "Max workers: ${MAX_WORKERS}"
 echo "Max size: ${MAX_SIZE_MB} MB"
 echo "Preprocess: ${ENABLE_PREPROCESS}"
-echo "Target FS: ${TARGET_FS} Hz (align: ${ALIGN_SFREQ})"
-echo "Target duration: ${TARGET_DURATION:-none} sec (mode: ${LENGTH_MODE})"
-echo "Standard channels: ${STANDARD_CHANNELS:-none}"
 echo "=========================================="
 echo ""
 
-# 激活 conda 环境
-# --- 根据集群的 conda 初始化方式可能需调整下面这行 ---
-if command -v conda &> /dev/null; then
-    # 方法1: conda init 已生效
-    eval "$(conda shell.bash hook)"
-    conda activate "${CONDA_ENV}"
-elif [ -f "/path/to/miniconda3/etc/profile.d/conda.sh" ]; then
-    # 方法2: 手动 source conda.sh (请将路径替换为实际路径)
-    source "/path/to/miniconda3/etc/profile.d/conda.sh"
-    conda activate "${CONDA_ENV}"
-else
-    echo "[ERROR] 无法激活 conda 环境: ${CONDA_ENV}"
-    echo "请检查 conda 安装路径并更新本脚本中的 source 路径"
-    exit 1
-fi
+activate_conda
 
-# 验证环境
-echo "Using Python: $(which python3)"
-python3 -c "import mne, openneuro, requests; print(f'MNE {mne.__version__}, openneuro-py {openneuro.__version__}')" 2>&1
+echo "Using Python: $(command -v "${PYTHON_BIN}" || echo "${PYTHON_BIN}")"
+if is_true "${CHECK_IMPORTS}" && [ -n "${REQUIRED_IMPORTS}" ]; then
+    "${PYTHON_BIN}" -c "${REQUIRED_IMPORTS}; print('Required imports OK')"
+fi
 echo ""
 
-# 构建命令 (使用 MB 上限)
-CMD="${SCRIPT} --output-dir ${OUTPUT_DIR} --max-size-mb ${MAX_SIZE_MB} --max-workers ${MAX_WORKERS}"
+mkdir -p "${OUTPUT_DIR}"
 
-# 预处理参数
-if [ "${ENABLE_PREPROCESS}" = "true" ]; then
-    PREPROC_FLAGS="--preprocess --target-fs ${TARGET_FS}"
+CMD=(
+    "${PYTHON_BIN}"
+    "${DOWNLOAD_SCRIPT}"
+    "--output-dir" "${OUTPUT_DIR}"
+    "--max-size-mb" "${MAX_SIZE_MB}"
+    "--max-workers" "${MAX_WORKERS}"
+)
 
-    # 采样率对齐
-    if [ "${ALIGN_SFREQ}" != "true" ]; then
-        PREPROC_FLAGS="${PREPROC_FLAGS} --no-align-sfreq"
+if is_true "${DRY_RUN}"; then
+    CMD+=("--dry-run")
+fi
+
+if is_true "${ENABLE_PREPROCESS}"; then
+    CMD+=("--preprocess" "--target-fs" "${TARGET_FS}")
+
+    if ! is_true "${ALIGN_SFREQ}"; then
+        CMD+=("--no-align-sfreq")
     fi
 
-    # 标准通道集
     if [ -n "${STANDARD_CHANNELS}" ]; then
-        PREPROC_FLAGS="${PREPROC_FLAGS} --standard-channels ${STANDARD_CHANNELS}"
-        if [ "${INTERPOLATE_CHANNELS}" = "true" ]; then
-            PREPROC_FLAGS="${PREPROC_FLAGS} --interpolate-channels"
+        CMD+=("--standard-channels" "${STANDARD_CHANNELS}")
+        if is_true "${INTERPOLATE_CHANNELS}"; then
+            CMD+=("--interpolate-channels")
         fi
     fi
 
-    # 长度对齐
     if [ -n "${TARGET_DURATION}" ]; then
-        PREPROC_FLAGS="${PREPROC_FLAGS} --target-duration ${TARGET_DURATION} --length-mode ${LENGTH_MODE}"
+        CMD+=("--target-duration" "${TARGET_DURATION}" "--length-mode" "${LENGTH_MODE}")
     fi
 
-    # 原始文件处理
-    if [ "${REMOVE_ORIGINAL}" != "true" ]; then
-        PREPROC_FLAGS="${PREPROC_FLAGS} --no-remove-original"
+    if ! is_true "${REMOVE_ORIGINAL}"; then
+        CMD+=("--no-remove-original")
     fi
-
-    CMD="${CMD} ${PREPROC_FLAGS}"
 fi
 
-# 附加参数
-if [ -n "${EXTRA_ARGS}" ]; then
-    CMD="${CMD} ${EXTRA_ARGS}"
+if [ "$#" -gt 0 ]; then
+    CMD+=("$@")
 fi
 
-echo "Running: ${CMD}"
+print_command "${CMD[@]}"
 echo "=========================================="
 echo ""
 
-# 执行
-cd "${SCRIPT_DIR}"
-python3 ${CMD}
-
+cd "$(dirname "${DOWNLOAD_SCRIPT}")"
+"${CMD[@]}"
 EXIT_CODE=$?
 
 echo ""
@@ -173,4 +259,4 @@ echo "Job finished at: $(date)"
 echo "Exit code: ${EXIT_CODE}"
 echo "=========================================="
 
-exit ${EXIT_CODE}
+exit "${EXIT_CODE}"
