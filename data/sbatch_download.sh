@@ -68,9 +68,15 @@ OUTPUT_DIR="${OUTPUT_DIR:-${DEFAULT_OUTPUT_DIR}}"
 LOG_DIR="${LOG_DIR:-${SHARED_EEG_ROOT}/logs/download}"
 
 # Runtime environment. Set CONDA_ENV="" to skip conda activation.
-CONDA_ENV="${CONDA_ENV-eeg_fm}"
 CONDA_SH="${CONDA_SH:-}"
-PYTHON_BIN="${PYTHON_BIN:-python3}"
+SHARED_ENV_PYTHON="${SHARED_ENV_PYTHON:-${SHARED_EEG_ROOT}/envs/eeg_fm/bin/python}"
+if [ -z "${PYTHON_BIN+x}" ] && [ -x "${SHARED_ENV_PYTHON}" ]; then
+    PYTHON_BIN="${SHARED_ENV_PYTHON}"
+    CONDA_ENV="${CONDA_ENV-}"
+else
+    PYTHON_BIN="${PYTHON_BIN:-python3}"
+    CONDA_ENV="${CONDA_ENV-eeg_fm}"
+fi
 CHECK_IMPORTS="${CHECK_IMPORTS:-true}"
 export PYTHONNOUSERSITE="${PYTHONNOUSERSITE:-1}"
 

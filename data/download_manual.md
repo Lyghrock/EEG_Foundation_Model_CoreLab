@@ -48,8 +48,9 @@ Do not commit credential files or paste passwords into Slurm command lines.
 
 ## Shared Slurm Bundle
 
-When the Slurm submission account cannot read `/home/weijun`, deploy the
-download launcher and Python scripts into a shared directory first:
+When the Slurm submission account cannot read `/home/weijun`, keep the runnable
+download bundle under the shared EEG dataset root. Do this deployment from the
+account that maintains the repository, then run Slurm from the download account:
 
 ```bash
 mkdir -p /mnt/ddn/shared/datasets/eeg/download_scripts
@@ -74,9 +75,8 @@ cp data/config_physionet.json \
 chmod 600 /mnt/ddn/shared/datasets/eeg/download_scripts/config_physionet.json
 ```
 
-For cross-account Slurm jobs, prefer a conda prefix in the shared tree and call
-its Python by absolute path. This avoids relying on interactive shell conda
-activation:
+For cross-account Slurm jobs, prefer a conda prefix in the shared tree. This
+avoids relying on interactive shell conda activation:
 
 ```bash
 conda create -y -p /mnt/ddn/shared/datasets/eeg/envs/eeg_fm python=3.10
@@ -90,8 +90,6 @@ Submit OpenNeuro from the shared bundle:
 cd /mnt/ddn/shared/datasets/eeg/download_scripts
 
 DATA_SOURCE=openneuro \
-CONDA_ENV="" \
-PYTHON_BIN=/mnt/ddn/shared/datasets/eeg/envs/eeg_fm/bin/python \
 MAX_WORKERS=8 \
 MAX_SIZE_MB=0 \
 sbatch sbatch_download.sh
@@ -103,11 +101,19 @@ Submit PhysioNet from the shared bundle:
 cd /mnt/ddn/shared/datasets/eeg/download_scripts
 
 DATA_SOURCE=physionet \
-CONDA_ENV="" \
-PYTHON_BIN=/mnt/ddn/shared/datasets/eeg/envs/eeg_fm/bin/python \
 MAX_WORKERS=4 \
 MAX_SIZE_MB=0 \
 sbatch sbatch_download.sh --discover --sort size
+```
+
+If `/mnt/ddn/shared/datasets/eeg/envs/eeg_fm/bin/python` exists, the launcher
+uses it automatically and skips `conda activate`. You can still override this
+explicitly:
+
+```bash
+CONDA_ENV="" \
+PYTHON_BIN=/mnt/ddn/shared/datasets/eeg/envs/eeg_fm/bin/python \
+sbatch sbatch_download.sh
 ```
 
 ## OpenNeuro
