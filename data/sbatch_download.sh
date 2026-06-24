@@ -9,7 +9,7 @@
 # 说明:
 #   - 不申请 GPU
 #   - 分配 N 个 CPU 核心用于并行下载 (由 --cpus-per-task 控制)
-#   - 下载完成后自动执行预处理压缩 (降采样、去除非EEG通道)
+#   - 下载完成后自动执行预处理压缩 (采样率对齐、通道对齐、长度对齐)
 #   - 输出日志到 logs/ 目录
 # =============================================================================
 
@@ -26,10 +26,22 @@
 # 用户配置区域 (请根据实际情况修改 ↓)
 # ============================================
 CONDA_ENV="eeg_fm"
-OUTPUT_DIR="/path/to/your/storage/EEG"   # ← 修改为你的存储路径
-MAX_SIZE_GB=1000                          # 下载上限 (GB)
+OUTPUT_DIR="/mnt/ddn/weijun/EEG/"   # ← 修改为你的存储路径
+
+# ── 下载控制 ──────────────────────────────────
+MAX_SIZE_MB=1000                        # 下载上限 (MB), 0=不限
 MAX_WORKERS=8                             # 并行下载线程数 (<= CPUS_PER_TASK)
-TARGET_FS=250                             # 预处理降采样频率 (Hz)
+
+# ── 预处理对齐 ────────────────────────────────
+TARGET_FS=250                             # 目标采样率 (Hz)
+ALIGN_SFREQ=true                          # true=强制对齐所有文件到 TARGET_FS
+STANDARD_CHANNELS=""                      # 标准通道集 (逗号分隔, 空=不启用)
+                                          # 例: "Fp1,Fp2,F3,F4,C3,C4,P3,P4,O1,O2,F7,F8,T7,T8,P7,P8,Fz,Cz,Pz,FCz"
+TARGET_DURATION=""                        # 目标时长秒数 (空=不启用)
+LENGTH_MODE="crop"                        # 长度对齐模式: crop/truncate/pad
+INTERPOLATE_CHANNELS=false                # 是否插值缺失的标准通道
+
+# ── 后处理 ────────────────────────────────────
 ENABLE_PREPROCESS=true                    # true=下载后自动预处理
 REMOVE_ORIGINAL=true                      # true=预处理后删除原始文件
 # ============================================
@@ -37,9 +49,34 @@ REMOVE_ORIGINAL=true                      # true=预处理后删除原始文件
 # 解析额外参数 (传递给 Python 脚本)
 EXTRA_ARGS="$@"
 
-# 自动检测脚本路径
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-SCRIPT="${SCRIPT_DIR}/down_EEG.py"
+# 自动检测脚本路径:
+# 某些集群会把 sbatch 脚本复制到 spool 目录执行, 此时 BASH_SOURCE[0] 不可靠。
+# 因此优先使用提交目录, 并在候选目录中查找 down_EEG.py。
+SCRIPT_BASENAME="down_EEG.py"
+SCRIPT_DIR=""
+
+CANDIDATES=()
+[ -n "${SLURM_SUBMIT_DIR}" ] && CANDIDATES+=("${SLURM_SUBMIT_DIR}")
+CANDIDATES+=("${PWD}")
+CANDIDATES+=("$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)")
+
+for d in "${CANDIDATES[@]}"; do
+    if [ -f "${d}/${SCRIPT_BASENAME}" ]; then
+        SCRIPT_DIR="${d}"
+        break
+    fi
+done
+
+if [ -z "${SCRIPT_DIR}" ]; then
+    echo "[ERROR] 未找到下载脚本: ${SCRIPT_BASENAME}"
+    echo "检查过的目录:"
+    for d in "${CANDIDATES[@]}"; do
+        echo "  - ${d}"
+    done
+    exit 1
+fi
+
+SCRIPT="${SCRIPT_DIR}/${SCRIPT_BASENAME}"
 
 # 创建日志目录
 mkdir -p "${SCRIPT_DIR}/logs"
@@ -53,8 +90,11 @@ echo "CPU cores: ${SLURM_CPUS_PER_TASK:-8}"
 echo "Memory: ${SLURM_MEM:-32G}"
 echo "Output dir: ${OUTPUT_DIR}"
 echo "Max workers: ${MAX_WORKERS}"
-echo "Max size: ${MAX_SIZE_GB} GB"
+echo "Max size: ${MAX_SIZE_MB} MB"
 echo "Preprocess: ${ENABLE_PREPROCESS}"
+echo "Target FS: ${TARGET_FS} Hz (align: ${ALIGN_SFREQ})"
+echo "Target duration: ${TARGET_DURATION:-none} sec (mode: ${LENGTH_MODE})"
+echo "Standard channels: ${STANDARD_CHANNELS:-none}"
 echo "=========================================="
 echo ""
 
@@ -79,17 +119,36 @@ echo "Using Python: $(which python3)"
 python3 -c "import mne, openneuro, requests; print(f'MNE {mne.__version__}, openneuro-py {openneuro.__version__}')" 2>&1
 echo ""
 
-# 构建命令
-CMD="${SCRIPT} --output-dir ${OUTPUT_DIR} --max-size ${MAX_SIZE_GB} --max-workers ${MAX_WORKERS}"
+# 构建命令 (使用 MB 上限)
+CMD="${SCRIPT} --output-dir ${OUTPUT_DIR} --max-size-mb ${MAX_SIZE_MB} --max-workers ${MAX_WORKERS}"
 
-# --no-remove-original 含义: "不删除原始文件"
-# REMOVE_ORIGINAL=true  → 要删除 → 不传 --no-remove-original
-# REMOVE_ORIGINAL=false → 保留   → 传 --no-remove-original
-PREPROC_FLAGS="--preprocess --target-fs ${TARGET_FS}"
+# 预处理参数
 if [ "${ENABLE_PREPROCESS}" = "true" ]; then
+    PREPROC_FLAGS="--preprocess --target-fs ${TARGET_FS}"
+
+    # 采样率对齐
+    if [ "${ALIGN_SFREQ}" != "true" ]; then
+        PREPROC_FLAGS="${PREPROC_FLAGS} --no-align-sfreq"
+    fi
+
+    # 标准通道集
+    if [ -n "${STANDARD_CHANNELS}" ]; then
+        PREPROC_FLAGS="${PREPROC_FLAGS} --standard-channels ${STANDARD_CHANNELS}"
+        if [ "${INTERPOLATE_CHANNELS}" = "true" ]; then
+            PREPROC_FLAGS="${PREPROC_FLAGS} --interpolate-channels"
+        fi
+    fi
+
+    # 长度对齐
+    if [ -n "${TARGET_DURATION}" ]; then
+        PREPROC_FLAGS="${PREPROC_FLAGS} --target-duration ${TARGET_DURATION} --length-mode ${LENGTH_MODE}"
+    fi
+
+    # 原始文件处理
     if [ "${REMOVE_ORIGINAL}" != "true" ]; then
         PREPROC_FLAGS="${PREPROC_FLAGS} --no-remove-original"
     fi
+
     CMD="${CMD} ${PREPROC_FLAGS}"
 fi
 
