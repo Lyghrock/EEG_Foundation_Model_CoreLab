@@ -66,6 +66,11 @@ The launcher is relocatable. By default, it resolves `download_OpenNeuro.py` and
 `download_PhysioNet.py` from the same directory as `sbatch_download.sh`, and logs
 to `/mnt/ddn/shared/datasets/eeg/logs/download`.
 
+Under Slurm, the batch script may be copied into the scheduler spool directory
+before execution. The launcher therefore prefers `SLURM_SUBMIT_DIR` when that
+directory contains `download_*.py`. If submitting from another directory, set
+`DOWNLOAD_SCRIPT_DIR=/absolute/path/to/repo/data`.
+
 For PhysioNet, also place the ignored credential file next to the copied
 `download_PhysioNet.py`:
 

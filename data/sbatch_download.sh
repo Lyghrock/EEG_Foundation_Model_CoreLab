@@ -28,8 +28,21 @@
 
 set -euo pipefail
 
-LAUNCHER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 SHARED_EEG_ROOT="${SHARED_EEG_ROOT:-/mnt/ddn/shared/datasets/eeg}"
+
+resolve_script_dir() {
+    # Slurm copies the batch script into its spool directory before execution,
+    # so BASH_SOURCE[0] can point at /cm/.../spool/job*/ instead of the submit
+    # directory. Prefer SLURM_SUBMIT_DIR when it contains the downloader files.
+    if [ -n "${SLURM_SUBMIT_DIR:-}" ] && ls "${SLURM_SUBMIT_DIR}"/download_*.py >/dev/null 2>&1; then
+        cd "${SLURM_SUBMIT_DIR}" && pwd -P
+        return
+    fi
+
+    cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P
+}
+
+LAUNCHER_DIR="$(resolve_script_dir)"
 
 # =============================================================================
 # User configuration - use absolute paths for H100 or other shared accounts.
