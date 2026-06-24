@@ -46,6 +46,70 @@ The PhysioNet downloader reads credentials in this priority order:
 
 Do not commit credential files or paste passwords into Slurm command lines.
 
+## Shared Slurm Bundle
+
+When the Slurm submission account cannot read `/home/weijun`, deploy the
+download launcher and Python scripts into a shared directory first:
+
+```bash
+mkdir -p /mnt/ddn/shared/datasets/eeg/download_scripts
+
+cp data/sbatch_download.sh \
+  data/download_OpenNeuro.py \
+  data/download_PhysioNet.py \
+  requirements.txt \
+  /mnt/ddn/shared/datasets/eeg/download_scripts/
+```
+
+The launcher is relocatable. By default, it resolves `download_OpenNeuro.py` and
+`download_PhysioNet.py` from the same directory as `sbatch_download.sh`, and logs
+to `/mnt/ddn/shared/datasets/eeg/logs/download`.
+
+For PhysioNet, also place the ignored credential file next to the copied
+`download_PhysioNet.py`:
+
+```bash
+cp data/config_physionet.json \
+  /mnt/ddn/shared/datasets/eeg/download_scripts/config_physionet.json
+chmod 600 /mnt/ddn/shared/datasets/eeg/download_scripts/config_physionet.json
+```
+
+For cross-account Slurm jobs, prefer a conda prefix in the shared tree and call
+its Python by absolute path. This avoids relying on interactive shell conda
+activation:
+
+```bash
+conda create -y -p /mnt/ddn/shared/datasets/eeg/envs/eeg_fm python=3.10
+/mnt/ddn/shared/datasets/eeg/envs/eeg_fm/bin/python -m pip install \
+  -r /mnt/ddn/shared/datasets/eeg/download_scripts/requirements.txt
+```
+
+Submit OpenNeuro from the shared bundle:
+
+```bash
+cd /mnt/ddn/shared/datasets/eeg/download_scripts
+
+DATA_SOURCE=openneuro \
+CONDA_ENV="" \
+PYTHON_BIN=/mnt/ddn/shared/datasets/eeg/envs/eeg_fm/bin/python \
+MAX_WORKERS=8 \
+MAX_SIZE_MB=0 \
+sbatch sbatch_download.sh
+```
+
+Submit PhysioNet from the shared bundle:
+
+```bash
+cd /mnt/ddn/shared/datasets/eeg/download_scripts
+
+DATA_SOURCE=physionet \
+CONDA_ENV="" \
+PYTHON_BIN=/mnt/ddn/shared/datasets/eeg/envs/eeg_fm/bin/python \
+MAX_WORKERS=4 \
+MAX_SIZE_MB=0 \
+sbatch sbatch_download.sh --discover --sort size
+```
+
 ## OpenNeuro
 
 Dry-run all OpenNeuro EEG datasets:
@@ -179,11 +243,12 @@ environment variables:
 
 ```bash
 DATA_SOURCE=openneuro|physionet
-REPO_DIR=/absolute/path/to/EEG_Foundation_Model_CoreLab
+DOWNLOAD_SCRIPT_DIR=/absolute/path/to/download_scripts
 OUTPUT_DIR=/absolute/path/to/data/root
 LOG_DIR=/absolute/path/to/log/root
 CONDA_SH=/absolute/path/to/miniconda3/etc/profile.d/conda.sh
 CONDA_ENV=eeg_fm
+PYTHON_BIN=/absolute/path/to/python
 ```
 
 The launcher does not pull git, sync files, or start preprocessing by default.

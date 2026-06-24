@@ -28,6 +28,9 @@
 
 set -euo pipefail
 
+LAUNCHER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+SHARED_EEG_ROOT="${SHARED_EEG_ROOT:-/mnt/ddn/shared/datasets/eeg}"
+
 # =============================================================================
 # User configuration - use absolute paths for H100 or other shared accounts.
 # Values can also be overridden at submission time, for example:
@@ -52,21 +55,24 @@ case "${DATA_SOURCE}" in
         ;;
 esac
 
-# Absolute code paths.
-REPO_DIR="${REPO_DIR:-/home/weijun/Brain_FM/EEG_Foundation_Model_CoreLab}"
-OPENNEURO_SCRIPT="${OPENNEURO_SCRIPT:-${REPO_DIR}/data/download_OpenNeuro.py}"
-PHYSIONET_SCRIPT="${PHYSIONET_SCRIPT:-${REPO_DIR}/data/download_PhysioNet.py}"
+# Absolute code paths. By default, keep this launcher and download_*.py files in
+# the same directory so the whole download bundle can live outside /home/weijun.
+DOWNLOAD_SCRIPT_DIR="${DOWNLOAD_SCRIPT_DIR:-${LAUNCHER_DIR}}"
+REPO_DIR="${REPO_DIR:-${DOWNLOAD_SCRIPT_DIR}}"
+OPENNEURO_SCRIPT="${OPENNEURO_SCRIPT:-${DOWNLOAD_SCRIPT_DIR}/download_OpenNeuro.py}"
+PHYSIONET_SCRIPT="${PHYSIONET_SCRIPT:-${DOWNLOAD_SCRIPT_DIR}/download_PhysioNet.py}"
 CUSTOM_DOWNLOAD_SCRIPT="${CUSTOM_DOWNLOAD_SCRIPT:-}"
 
 # Absolute storage/log paths.
 OUTPUT_DIR="${OUTPUT_DIR:-${DEFAULT_OUTPUT_DIR}}"
-LOG_DIR="${LOG_DIR:-${REPO_DIR}/logs/download}"
+LOG_DIR="${LOG_DIR:-${SHARED_EEG_ROOT}/logs/download}"
 
 # Runtime environment. Set CONDA_ENV="" to skip conda activation.
 CONDA_ENV="${CONDA_ENV-eeg_fm}"
 CONDA_SH="${CONDA_SH:-}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 CHECK_IMPORTS="${CHECK_IMPORTS:-true}"
+export PYTHONNOUSERSITE="${PYTHONNOUSERSITE:-1}"
 
 # Download controls shared by download_OpenNeuro.py and planned future scripts.
 MAX_SIZE_MB="${MAX_SIZE_MB:-0}"          # 0 means unlimited when supported.
