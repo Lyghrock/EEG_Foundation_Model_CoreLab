@@ -15,6 +15,7 @@ build/
 venv/
 env/
 *.env
+data/config_physionet.json
 
 # ── Data ──
 data/*.fif

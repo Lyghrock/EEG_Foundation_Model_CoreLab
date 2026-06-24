@@ -45,6 +45,7 @@ import requests
 
 
 PHYSIONET_BASE = "https://physionet.org"
+DATABASE_URL = f"{PHYSIONET_BASE}/about/database/"
 DEFAULT_VERSION = "1.0.0"
 PAGE_TIMEOUT = 60
 WGET_CUT_DIRS = "3"  # files/<slug>/<version>/...
@@ -53,6 +54,18 @@ EEG_TEXT_RE = re.compile(
     r"\bEEG\b|electroencephal(?:ogram|ography|ographic|ograms|ographs)?",
     re.IGNORECASE,
 )
+EEG_CONTEXT_RE = re.compile(
+    r"dataset|data|database|recording|recorded|records|contains|include|"
+    r"including|signals?|channels?|scalp|polysomno|PSG|sleep|seizure|BCI|"
+    r"brain[- ]computer|evoked|imagery|headband|spectra",
+    re.IGNORECASE,
+)
+EEG_CITATION_RE = re.compile(
+    r"\bdoi\b|citation|references?|article|journal|proceedings|"
+    r"@article|bibliography",
+    re.IGNORECASE,
+)
+NON_EEG_RE = re.compile(r"\bnon[- ]?eeg\b", re.IGNORECASE)
 NEGATIVE_MODALITY_RE = re.compile(
     r"\bECG\b|electrocardiogram|electrocardiography",
     re.IGNORECASE,
@@ -68,6 +81,14 @@ ACCESS_RE = re.compile(
 )
 TITLE_RE = re.compile(r"<h1[^>]*>(.*?)</h1>", re.IGNORECASE | re.DOTALL)
 HREF_RE = re.compile(r'href=["\']([^"\']+)["\']', re.IGNORECASE)
+CONTENT_VERSION_PATH_RE = re.compile(
+    r"^/content/([A-Za-z0-9_.-]+)/([^/?#]+)/?$",
+    re.IGNORECASE,
+)
+CONTENT_SLUG_PATH_RE = re.compile(
+    r"^/content/([A-Za-z0-9_.-]+)/?$",
+    re.IGNORECASE,
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -218,9 +239,6 @@ def read_dataset_specs(args: argparse.Namespace) -> list[DatasetSpec]:
                 if line:
                     raw_specs.append(line)
 
-    if not raw_specs:
-        raise ValueError("provide --dataset, --url, or --datasets-file")
-
     seen: set[str] = set()
     specs: list[DatasetSpec] = []
     for raw in raw_specs:
@@ -230,6 +248,101 @@ def read_dataset_specs(args: argparse.Namespace) -> list[DatasetSpec]:
         seen.add(spec.id)
         specs.append(spec)
     return specs
+
+
+def discover_dataset_specs(
+    session: requests.Session,
+    discover_url: str,
+    default_version: str,
+    workers: int,
+    limit: Optional[int] = None,
+) -> list[DatasetSpec]:
+    """Discover PhysioNet project/version links from the official database page."""
+    status, raw_html = fetch_text(session, discover_url)
+    if status >= 400:
+        raise RuntimeError(f"discovery page HTTP {status}: {discover_url}")
+
+    seen: set[str] = set()
+    items: list[DatasetSpec | str] = []
+    slug_seen: set[str] = set()
+    auth = session.auth
+    headers = dict(session.headers)
+
+    def add_item(item: DatasetSpec | str):
+        if isinstance(item, DatasetSpec):
+            key = item.id
+            if key in seen:
+                return
+            seen.add(key)
+        else:
+            if item in slug_seen:
+                return
+            slug_seen.add(item)
+        items.append(item)
+
+    def resolve_slug(slug: str) -> DatasetSpec:
+        worker_session = requests.Session()
+        worker_session.headers.update(headers)
+        if auth:
+            worker_session.auth = auth
+        return resolve_latest_spec(worker_session, slug, default_version)
+
+    for href in HREF_RE.findall(raw_html):
+        parsed = urlparse(urljoin(discover_url, href))
+        version_match = CONTENT_VERSION_PATH_RE.match(parsed.path)
+        slug_match = CONTENT_SLUG_PATH_RE.match(parsed.path)
+        if version_match:
+            add_item(DatasetSpec(slug=version_match.group(1), version=version_match.group(2)))
+        elif slug_match:
+            slug = slug_match.group(1)
+            if slug:
+                add_item(slug)
+        if limit is not None and len(items) >= limit:
+            break
+
+    specs: list[DatasetSpec] = []
+    slug_items = [item for item in items if isinstance(item, str)]
+    resolved_by_slug: dict[str, DatasetSpec] = {}
+    if slug_items:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            future_map = {pool.submit(resolve_slug, slug): slug for slug in slug_items}
+            for future in concurrent.futures.as_completed(future_map):
+                slug = future_map[future]
+                resolved_by_slug[slug] = future.result()
+
+    spec_seen: set[str] = set()
+    for item in items:
+        spec = resolved_by_slug[item] if isinstance(item, str) else item
+        if spec.id in spec_seen:
+            continue
+        spec_seen.add(spec.id)
+        specs.append(spec)
+    return specs
+
+
+def resolve_latest_spec(
+    session: requests.Session,
+    slug: str,
+    default_version: str,
+) -> DatasetSpec:
+    try:
+        response = session.get(
+            f"{PHYSIONET_BASE}/content/{slug}/",
+            timeout=PAGE_TIMEOUT,
+            allow_redirects=True,
+        )
+        parsed = urlparse(response.url)
+        match = CONTENT_VERSION_PATH_RE.match(parsed.path)
+        if match:
+            return DatasetSpec(slug=match.group(1), version=match.group(2))
+        for href in HREF_RE.findall(response.text):
+            parsed_href = urlparse(urljoin(response.url, href))
+            match = CONTENT_VERSION_PATH_RE.match(parsed_href.path)
+            if match and match.group(1) == slug:
+                return DatasetSpec(slug=match.group(1), version=match.group(2))
+    except requests.RequestException:
+        pass
+    return DatasetSpec(slug=slug, version=default_version)
 
 
 def make_session(
@@ -246,6 +359,22 @@ def make_session(
     if username and password:
         session.auth = (username, password)
     return session
+
+
+def load_auth_config(path: Optional[Path]) -> dict[str, str]:
+    if path is None or not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid PhysioNet config JSON: {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"PhysioNet config must be a JSON object: {path}")
+    return {
+        str(k): str(v)
+        for k, v in data.items()
+        if v is not None
+    }
 
 
 def fetch_text(
@@ -326,13 +455,26 @@ def probe_files_index(
 
 
 def find_eeg_evidence(text: str, source: str) -> str:
-    match = EEG_TEXT_RE.search(text)
-    if not match:
-        return ""
-    start = max(match.start() - 50, 0)
-    end = min(match.end() + 80, len(text))
-    snippet = re.sub(r"\s+", " ", text[start:end]).strip()
-    return f"{source}: {snippet}"
+    for match in EEG_TEXT_RE.finditer(text):
+        start = max(match.start() - 80, 0)
+        end = min(match.end() + 120, len(text))
+        snippet = re.sub(r"\s+", " ", text[start:end]).strip()
+        if not is_acceptable_eeg_evidence(snippet, source):
+            continue
+        return f"{source}: {snippet}"
+    return ""
+
+
+def is_acceptable_eeg_evidence(snippet: str, source: str) -> bool:
+    if NON_EEG_RE.search(snippet):
+        return False
+    if source == "title":
+        return True
+    if source in {"file path", "files index"} or source.startswith("files child index"):
+        return True
+    if EEG_CITATION_RE.search(snippet) and not EEG_CONTEXT_RE.search(snippet):
+        return False
+    return bool(EEG_CONTEXT_RE.search(snippet))
 
 
 def resolve_dataset(
@@ -362,7 +504,9 @@ def resolve_dataset(
     info.access = parse_access(content_text)
     info.size_bytes = parse_size(content_text)
 
-    evidence = find_eeg_evidence(content_text, "content page")
+    evidence = find_eeg_evidence(info.title, "title")
+    if not evidence:
+        evidence = find_eeg_evidence(content_text, "content page")
     if not evidence:
         try:
             _, evidence = probe_files_index(session, spec, probe_subdirs)
@@ -403,6 +547,48 @@ def format_table(infos: list[DatasetInfo]):
             print(f"    reason: {info.reject_reason}")
     print("=" * 118)
     print()
+
+
+def write_eeg_list(infos: list[DatasetInfo], output_path: Path):
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        f"{info.spec.id}  # {info.size_str} | {info.title}"
+        for info in infos
+        if info.is_eeg
+    ]
+    output_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+
+
+def resolve_all_datasets(
+    specs: list[DatasetSpec],
+    username: Optional[str],
+    password: Optional[str],
+    probe_subdirs: int,
+    resolve_workers: int,
+) -> list[DatasetInfo]:
+    if resolve_workers <= 1:
+        session = make_session(username, password)
+        return [
+            resolve_dataset(spec, session, probe_subdirs=probe_subdirs)
+            for spec in specs
+        ]
+
+    def worker(spec: DatasetSpec) -> DatasetInfo:
+        session = make_session(username, password)
+        return resolve_dataset(spec, session, probe_subdirs=probe_subdirs)
+
+    infos: list[DatasetInfo] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=resolve_workers) as pool:
+        future_map = {pool.submit(worker, spec): spec for spec in specs}
+        completed = 0
+        total = len(future_map)
+        for future in concurrent.futures.as_completed(future_map):
+            completed += 1
+            info = future.result()
+            infos.append(info)
+            if total >= 20 and (completed % 20 == 0 or completed == total):
+                print(f"[DISCOVER] resolved {completed}/{total}", file=sys.stderr)
+    return infos
 
 
 def build_wget_config(
@@ -671,10 +857,43 @@ def build_parser() -> argparse.ArgumentParser:
         help="Download root directory.",
     )
     parser.add_argument("--dry-run", "--dryrun", action="store_true", dest="dry_run")
+    parser.add_argument(
+        "--discover",
+        action="store_true",
+        help="Discover all PhysioNet projects from the official database page, then keep EEG-validated datasets.",
+    )
+    parser.add_argument(
+        "--discover-url",
+        default=DATABASE_URL,
+        help=f"Discovery source page (default: {DATABASE_URL}).",
+    )
+    parser.add_argument(
+        "--discover-limit",
+        type=int,
+        default=None,
+        help="Limit number of discovered project links for quick tests.",
+    )
+    parser.add_argument(
+        "--show-rejected",
+        action="store_true",
+        help="In --discover mode, also print datasets rejected by EEG validation.",
+    )
+    parser.add_argument(
+        "--write-eeg-list",
+        type=Path,
+        default=None,
+        help="Write EEG-validated dataset IDs to a text file after validation.",
+    )
     parser.add_argument("--sort", choices=["size", "name"], default=None)
     parser.add_argument("--max-size", type=float, default=None, metavar="GB")
     parser.add_argument("--max-size-mb", type=float, default=None, metavar="MB")
     parser.add_argument("--max-workers", type=int, default=2)
+    parser.add_argument(
+        "--resolve-workers",
+        type=int,
+        default=6,
+        help="Parallel workers for PhysioNet metadata/discovery validation.",
+    )
     parser.add_argument(
         "--probe-subdirs",
         type=int,
@@ -691,8 +910,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument(
         "--username",
-        default=os.environ.get("PHYSIONET_USERNAME"),
-        help="PhysioNet username. Defaults to PHYSIONET_USERNAME.",
+        default=None,
+        help="PhysioNet username. Overrides PHYSIONET_USERNAME and config file.",
+    )
+    parser.add_argument(
+        "--config-file",
+        type=Path,
+        default=Path(__file__).with_name("config_physionet.json"),
+        help="Local JSON credentials file. Default: data/config_physionet.json.",
     )
     parser.add_argument(
         "--password-env",
@@ -723,6 +948,9 @@ def main() -> int:
     if args.max_workers < 1:
         print("[ERROR] --max-workers must be >= 1", file=sys.stderr)
         return 1
+    if args.resolve_workers < 1:
+        print("[ERROR] --resolve-workers must be >= 1", file=sys.stderr)
+        return 1
 
     if args.preprocess and not args.quiet:
         print(
@@ -732,28 +960,73 @@ def main() -> int:
         )
 
     try:
-        specs = read_dataset_specs(args)
+        config = load_auth_config(args.config_file)
     except ValueError as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
         return 1
 
-    username = args.username
-    password = os.environ.get(args.password_env) if args.password_env else None
+    username = (
+        args.username
+        or os.environ.get("PHYSIONET_USERNAME")
+        or config.get("username")
+    )
+    password = (
+        os.environ.get(args.password_env)
+        if args.password_env
+        else None
+    ) or config.get("password")
     if args.ask_password and username and not password:
         password = getpass.getpass(f"PhysioNet password for {username}: ")
 
     session = make_session(username, password)
-    infos = [
-        resolve_dataset(spec, session, probe_subdirs=args.probe_subdirs)
-        for spec in specs
-    ]
+    try:
+        specs = read_dataset_specs(args)
+        if args.discover:
+            discovered = discover_dataset_specs(
+                session,
+                args.discover_url,
+                default_version=args.default_version,
+                workers=args.resolve_workers,
+                limit=args.discover_limit,
+            )
+            print(
+                f"[DISCOVER] found {len(discovered)} PhysioNet project links from "
+                f"{args.discover_url}",
+                file=sys.stderr,
+            )
+            seen = {spec.id for spec in specs}
+            for spec in discovered:
+                if spec.id not in seen:
+                    specs.append(spec)
+                    seen.add(spec.id)
+        if not specs:
+            raise ValueError("provide --dataset, --url, --datasets-file, or --discover")
+    except (ValueError, RuntimeError) as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 1
+
+    infos = resolve_all_datasets(
+        specs,
+        username=username,
+        password=password,
+        probe_subdirs=args.probe_subdirs,
+        resolve_workers=args.resolve_workers,
+    )
 
     if args.sort == "size":
         infos.sort(key=lambda info: info.size_bytes, reverse=True)
     elif args.sort == "name":
         infos.sort(key=lambda info: info.title.lower())
 
-    format_table(infos)
+    if args.discover and not args.show_rejected:
+        display_infos = [info for info in infos if info.is_eeg]
+    else:
+        display_infos = infos
+    format_table(display_infos)
+
+    if args.write_eeg_list:
+        write_eeg_list(infos, args.write_eeg_list)
+        print(f"[INFO] wrote EEG dataset list: {args.write_eeg_list}")
 
     if args.dry_run:
         print("[DRY-RUN] no files downloaded")
@@ -765,7 +1038,14 @@ def main() -> int:
                 "REJECT_NO_EEG_EVIDENCE: files index request failed"
             )
         ]
-        return 1 if resolution_errors else 0
+        if resolution_errors and not args.discover:
+            return 1
+        if resolution_errors and args.show_rejected:
+            print(
+                f"[WARN] {len(resolution_errors)} dataset metadata requests failed",
+                file=sys.stderr,
+            )
+        return 0
 
     return run_downloads(infos, args, username, password)
 
