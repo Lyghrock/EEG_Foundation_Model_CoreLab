@@ -30,6 +30,7 @@ down_EEG.py — 并行批量下载 OpenNeuro EEG 数据集 + 可选预处理压�
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -38,6 +39,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -51,6 +53,7 @@ GRAPHQL_HEADERS = {
     "User-Agent": "EEG-FM-data-prep/0.1",
 }
 PAGE_SIZE = 100
+COMPLETE_MARKER = ".download_complete.json"
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -230,32 +233,115 @@ def _dir_size(path: Path) -> int:
     return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
 
 
+def _complete_marker(ds_path: Path) -> Path:
+    return ds_path / COMPLETE_MARKER
+
+
+def _has_complete_marker(ds_path: Path) -> bool:
+    return _complete_marker(ds_path).is_file()
+
+
+def _write_complete_marker(ds_path: Path, ds_id: str, backend: str, size_bytes: int):
+    marker = {
+        "dataset": ds_id,
+        "backend": backend,
+        "size_bytes": size_bytes,
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _complete_marker(ds_path).write_text(
+        json.dumps(marker, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _aws_command() -> Optional[list[str]]:
+    aws_bin = shutil.which("aws")
+    if aws_bin:
+        return [aws_bin]
+
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "awscli", "--version"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+        )
+        return [sys.executable, "-m", "awscli"]
+    except Exception:
+        return None
+
+
+def _resolve_backend(download_backend: str) -> str:
+    if download_backend == "auto":
+        return "aws" if _aws_command() else "openneuro"
+    return download_backend
+
+
+def _download_command(ds_id: str, ds_path: Path, backend: str) -> list[str]:
+    if backend == "aws":
+        aws_cmd = _aws_command()
+        if not aws_cmd:
+            raise RuntimeError(
+                "AWS backend requested but awscli is not available. "
+                "Install requirements.txt or use --download-backend openneuro."
+            )
+        return [
+            *aws_cmd,
+            "s3",
+            "sync",
+            "--no-sign-request",
+            "--only-show-errors",
+            f"s3://openneuro.org/{ds_id}",
+            str(ds_path),
+        ]
+
+    if backend == "openneuro":
+        return [
+            sys.executable,
+            "-m",
+            "openneuro",
+            "download",
+            "--dataset",
+            ds_id,
+            "--target-dir",
+            str(ds_path),
+        ]
+
+    raise ValueError(f"Unsupported OpenNeuro backend: {backend}")
+
+
 def download_one(
     ds_id: str,
     target_dir: Path,
     tracker: AtomicTracker,
     quiet: bool,
+    download_backend: str,
 ) -> bool:
     """下载单个数据集, 返回是否成功。"""
     ds_path = target_dir / ds_id
 
-    # 已存在 → 计数但跳过
-    if ds_path.exists():
+    # Only skip datasets that this script has marked complete. A leftover
+    # directory without the marker is treated as an interrupted download and
+    # the backend is run again so it can fill missing files.
+    if ds_path.exists() and _has_complete_marker(ds_path):
         exist = _dir_size(ds_path)
         tracker.add(exist / (1024 ** 3))
         if not quiet:
-            print(f"  [SKIP] {ds_id}: 已存在 ({exist/1e9:.1f} GB)")
+            print(f"  [SKIP] {ds_id}: 已完成 ({exist/1e9:.1f} GB)")
         return True
 
     if not quiet:
-        print(f"\n  [DOWNLOAD] {ds_id} ...")
+        action = "RESUME" if ds_path.exists() else "DOWNLOAD"
+        print(f"\n  [{action}] {ds_id} ...")
 
     try:
         ds_path.mkdir(parents=True, exist_ok=True)
+        backend = _resolve_backend(download_backend)
+        if not quiet:
+            print(f"  [BACKEND] {backend}")
         start = time.time()
         proc = subprocess.Popen(
-            [sys.executable, "-m", "openneuro", "download",
-             "--dataset", ds_id, "--target-dir", str(ds_path)],
+            _download_command(ds_id, ds_path, backend),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -280,6 +366,7 @@ def download_one(
 
         actual = _dir_size(ds_path)
         actual_gb = actual / (1024 ** 3)
+        _write_complete_marker(ds_path, ds_id, backend, actual)
         tracker.add(actual_gb)
         elapsed = time.time() - start
         speed = actual_gb / elapsed * 60 if elapsed > 0 else 0
@@ -287,7 +374,7 @@ def download_one(
         return True
 
     except FileNotFoundError:
-        print("\n  [ERROR] openneuro-py 未安装! pip install openneuro-py")
+        print("\n  [ERROR] 下载后端不可用: 请安装 openneuro-py 或 awscli")
         return False
     except Exception as e:
         print(f"\n  [ERROR] {ds_id}: {e}")
@@ -303,6 +390,7 @@ def run_pipeline(
     output_dir: Path,
     max_size: Optional[float],
     max_workers: int,
+    download_backend: str,
     preprocess: bool,
     preprocess_kwargs: Optional[dict],
     quiet: bool,
@@ -325,7 +413,13 @@ def run_pipeline(
             return ds.id, "limit_skip"
 
         # ← 下载
-        ok = download_one(ds.id, output_dir, tracker, quiet=quiet)
+        ok = download_one(
+            ds.id,
+            output_dir,
+            tracker,
+            quiet=quiet,
+            download_backend=download_backend,
+        )
 
         # ← 预处理 (可选)
         if ok and preprocess:
@@ -476,6 +570,9 @@ def build_parser() -> argparse.ArgumentParser:
     # 并行
     p.add_argument("--max-workers", type=int, default=4, metavar="N",
                    help="并行下载数 (默认 4, 受 CPU 核心数 & 带宽限制)")
+    p.add_argument("--download-backend", type=str, default="auto",
+                   choices=["auto", "openneuro", "aws"],
+                   help="下载后端: auto/aws/openneuro (默认 auto, 有 awscli 时走公开 S3)")
 
     # 预处理
     p.add_argument("--preprocess", action="store_true",
@@ -580,6 +677,8 @@ def main():
               f" | 全部估计: {total_est:.0f} GB")
     if args.max_workers > 1:
         print(f"  并行下载: {args.max_workers} 个 worker")
+    print(f"  下载后端: {args.download_backend}"
+          f" -> {_resolve_backend(args.download_backend)}")
     if args.preprocess:
         print(f"  预处理  : 已启用")
         print(f"    采样率: {args.target_fs} Hz"
@@ -604,6 +703,7 @@ def main():
         output_dir=args.output_dir,
         max_size=max_size,
         max_workers=args.max_workers,
+        download_backend=args.download_backend,
         preprocess=args.preprocess,
         preprocess_kwargs=preprocess_kwargs if args.preprocess else None,
         quiet=args.quiet,

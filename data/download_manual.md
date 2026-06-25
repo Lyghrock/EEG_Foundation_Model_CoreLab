@@ -157,10 +157,27 @@ OpenNeuro full download through Slurm:
 
 ```bash
 DATA_SOURCE=openneuro \
+OPENNEURO_BACKEND=auto \
 MAX_WORKERS=8 \
 MAX_SIZE_MB=0 \
 sbatch data/sbatch_download.sh
 ```
+
+If OpenNeuro downloads are slow or unstable, prefer the public S3 backend:
+
+```bash
+DATA_SOURCE=openneuro \
+OPENNEURO_BACKEND=aws \
+MAX_WORKERS=2 \
+MAX_SIZE_MB=0 \
+sbatch data/sbatch_download.sh
+```
+
+`OPENNEURO_BACKEND=auto` uses `awscli` when available and otherwise falls back
+to `openneuro-py`. AWS CLI also has internal multipart/concurrent transfers, so
+start with `MAX_WORKERS=2` or `4` instead of very high dataset-level parallelism.
+Interrupted dataset directories are resumed on the next run; only directories
+with `.download_complete.json` are skipped.
 
 ## PhysioNet
 

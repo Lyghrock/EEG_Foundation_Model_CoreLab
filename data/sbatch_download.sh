@@ -98,6 +98,7 @@ export PYTHONNOUSERSITE="${PYTHONNOUSERSITE:-1}"
 MAX_SIZE_MB="${MAX_SIZE_MB:-0}"          # 0 means unlimited when supported.
 MAX_WORKERS="${MAX_WORKERS:-${SLURM_CPUS_PER_TASK:-8}}"
 DRY_RUN="${DRY_RUN:-false}"
+OPENNEURO_BACKEND="${OPENNEURO_BACKEND:-auto}"  # auto, aws, openneuro
 
 # Optional preprocessing flags. Disable for pure download jobs.
 ENABLE_PREPROCESS="${ENABLE_PREPROCESS:-false}"
@@ -218,6 +219,7 @@ echo "Log file: ${LOG_FILE}"
 echo "CPU cores: ${SLURM_CPUS_PER_TASK:-${MAX_WORKERS}}"
 echo "Max workers: ${MAX_WORKERS}"
 echo "Max size: ${MAX_SIZE_MB} MB"
+echo "OpenNeuro backend: ${OPENNEURO_BACKEND}"
 echo "Preprocess: ${ENABLE_PREPROCESS}"
 echo "=========================================="
 echo ""
@@ -242,6 +244,10 @@ CMD=(
 
 if is_true "${DRY_RUN}"; then
     CMD+=("--dry-run")
+fi
+
+if [ "${DATA_SOURCE}" = "openneuro" ]; then
+    CMD+=("--download-backend" "${OPENNEURO_BACKEND}")
 fi
 
 if is_true "${ENABLE_PREPROCESS}"; then

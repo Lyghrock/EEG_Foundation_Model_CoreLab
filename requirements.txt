@@ -1,6 +1,7 @@
 # Core HTTP/download dependencies
 requests>=2.31
 openneuro-py>=2026.4.1
+awscli>=1.33
 
 # EEG I/O and preprocessing
 mne>=1.8
