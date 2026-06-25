@@ -95,8 +95,10 @@ cd /mnt/ddn/shared/datasets/eeg/download_scripts
 
 sbatch sbatch_download.sh \
   --data-source openneuro \
-  --max-workers 8 \
-  --max-size-mb 0
+  --download-backend aws \
+  --max-workers 4 \
+  --max-size-mb 0 \
+  --sort size
 ```
 
 Submit PhysioNet from the shared bundle:
@@ -159,25 +161,28 @@ OpenNeuro full download through Slurm:
 ```bash
 sbatch data/sbatch_download.sh \
   --data-source openneuro \
-  --download-backend auto \
-  --max-workers 8 \
-  --max-size-mb 0
+  --download-backend aws \
+  --max-workers 4 \
+  --max-size-mb 0 \
+  --sort size
 ```
 
-If OpenNeuro downloads are slow or unstable, prefer the public S3 backend:
+If OpenNeuro downloads are slow or unstable, keep the public S3 backend and
+reduce dataset-level workers:
 
 ```bash
 sbatch data/sbatch_download.sh \
   --data-source openneuro \
   --download-backend aws \
   --max-workers 2 \
-  --max-size-mb 0
+  --max-size-mb 0 \
+  --sort size
 ```
 
-`--download-backend auto` uses `awscli` when available and otherwise falls back
-to `openneuro-py`. AWS CLI also has internal multipart/concurrent transfers, so
-start with `--max-workers 2` or `4` instead of very high dataset-level
-parallelism.
+`--download-backend aws` uses OpenNeuro's public S3 bucket through `awscli`.
+AWS CLI also has internal multipart/concurrent transfers, so use
+`--max-workers 4` as the normal setting and reduce to `2` if the filesystem or
+network becomes saturated. `--sort size` downloads larger datasets first.
 Interrupted dataset directories are resumed on the next run; only directories
 with `.download_complete.json` are skipped.
 

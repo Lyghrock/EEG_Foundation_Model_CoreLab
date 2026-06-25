@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import select
 import shutil
 import subprocess
 import sys
@@ -54,6 +55,11 @@ GRAPHQL_HEADERS = {
 }
 PAGE_SIZE = 100
 COMPLETE_MARKER = ".download_complete.json"
+
+try:
+    from tqdm import tqdm
+except Exception:  # pragma: no cover - optional dependency
+    tqdm = None
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -290,7 +296,7 @@ def _download_command(ds_id: str, ds_path: Path, backend: str) -> list[str]:
             "s3",
             "sync",
             "--no-sign-request",
-            "--only-show-errors",
+            "--no-progress",
             f"s3://openneuro.org/{ds_id}",
             str(ds_path),
         ]
@@ -310,12 +316,32 @@ def _download_command(ds_id: str, ds_path: Path, backend: str) -> list[str]:
     raise ValueError(f"Unsupported OpenNeuro backend: {backend}")
 
 
+def _format_bytes(num_bytes: float) -> str:
+    units = ["B", "KB", "MB", "GB", "TB"]
+    value = float(num_bytes)
+    for unit in units:
+        if abs(value) < 1024 or unit == units[-1]:
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} TB"
+
+
+def _parse_aws_download_target(line: str) -> Optional[Path]:
+    if "download:" not in line or " to " not in line:
+        return None
+    target = line.rsplit(" to ", 1)[-1].strip()
+    if not target:
+        return None
+    return Path(target)
+
+
 def download_one(
     ds_id: str,
     target_dir: Path,
     tracker: AtomicTracker,
     quiet: bool,
     download_backend: str,
+    expected_size_bytes: int,
 ) -> bool:
     """下载单个数据集, 返回是否成功。"""
     ds_path = target_dir / ds_id
@@ -340,6 +366,40 @@ def download_one(
         if not quiet:
             print(f"  [BACKEND] {backend}")
         start = time.time()
+        initial_size = _dir_size(ds_path)
+        expected_total = expected_size_bytes if expected_size_bytes > 0 else None
+        pbar = None
+        transferred_bytes = 0
+        completed_files = 0
+        if not quiet and backend == "aws":
+            if expected_total:
+                print(
+                    f"  [PLAN] {ds_id}: expected total "
+                    f"{_format_bytes(expected_total)}, local existing "
+                    f"{_format_bytes(initial_size)}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"  [PLAN] {ds_id}: expected total unknown, local existing "
+                    f"{_format_bytes(initial_size)}",
+                    flush=True,
+                )
+            if tqdm is not None:
+                pbar = tqdm(
+                    total=expected_total,
+                    initial=min(initial_size, expected_total) if expected_total else 0,
+                    desc=ds_id,
+                    unit="B",
+                    unit_scale=True,
+                    unit_divisor=1024,
+                    mininterval=30,
+                    ascii=True,
+                    file=sys.stdout,
+                    leave=True,
+                    disable=quiet,
+                )
+
         proc = subprocess.Popen(
             _download_command(ds_id, ds_path, backend),
             stdout=subprocess.PIPE,
@@ -347,11 +407,73 @@ def download_one(
             text=True,
             bufsize=1,
         )
-        for line in proc.stdout:
-            if not quiet:
-                sys.stdout.write(line)
-                sys.stdout.flush()
+        last_heartbeat = time.time()
+        assert proc.stdout is not None
+        while True:
+            ready, _, _ = select.select([proc.stdout], [], [], 5)
+            if ready:
+                line = proc.stdout.readline()
+                if line:
+                    if backend == "aws":
+                        target_file = _parse_aws_download_target(line)
+                        if target_file is not None:
+                            completed_files += 1
+                            try:
+                                size = target_file.stat().st_size
+                            except OSError:
+                                size = 0
+                            transferred_bytes += size
+                            if pbar is not None and size > 0:
+                                if expected_total:
+                                    allowed = max(0, expected_total - pbar.n)
+                                    pbar.update(min(size, allowed))
+                                else:
+                                    pbar.update(size)
+                            elif not quiet and completed_files % 25 == 0:
+                                print(
+                                    f"  [PROGRESS] {ds_id}: {completed_files} files, "
+                                    f"{_format_bytes(transferred_bytes)} transferred",
+                                    flush=True,
+                                )
+                    if not quiet:
+                        sys.stdout.write(line)
+                        sys.stdout.flush()
+                    continue
+
+            if proc.poll() is not None:
+                remaining = proc.stdout.read()
+                if remaining and not quiet:
+                    sys.stdout.write(remaining)
+                    sys.stdout.flush()
+                break
+
+            now = time.time()
+            if not quiet and now - last_heartbeat >= 60:
+                elapsed_min = (now - start) / 60
+                current_size = initial_size + transferred_bytes
+                if expected_total:
+                    pct = min(100.0, current_size / expected_total * 100)
+                    progress = (
+                        f"{completed_files} files, {_format_bytes(current_size)} / "
+                        f"{_format_bytes(expected_total)} ({pct:.1f}%)"
+                    )
+                else:
+                    progress = (
+                        f"{completed_files} files, "
+                        f"{_format_bytes(transferred_bytes)} transferred"
+                    )
+                print(
+                    f"  [WAIT] {ds_id}: {backend} backend still running "
+                    f"({elapsed_min:.1f} min, {progress})",
+                    flush=True,
+                )
+                last_heartbeat = now
         proc.wait()
+        if pbar is not None:
+            if expected_total and pbar.n < expected_total and proc.returncode == 0:
+                pbar.n = min(expected_total, max(pbar.n, _dir_size(ds_path)))
+                pbar.refresh()
+            pbar.close()
 
         if proc.returncode != 0:
             print(f"  [ERROR] {ds_id}: return code {proc.returncode}")
@@ -419,6 +541,7 @@ def run_pipeline(
             tracker,
             quiet=quiet,
             download_backend=download_backend,
+            expected_size_bytes=ds.size_bytes,
         )
 
         # ← 预处理 (可选)

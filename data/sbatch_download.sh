@@ -22,7 +22,7 @@
 #SBATCH --error=slurm-%x-%j.err
 #SBATCH --ntasks=1
 #SBATCH --partition=h100
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=16
 #SBATCH --mem=32G
 #SBATCH --time=72:00:00
 #SBATCH --gres=gpu:1
@@ -118,12 +118,13 @@ fi
 CONDA_ENV="${CONDA_ENV:-}"
 CHECK_IMPORTS="${CHECK_IMPORTS:-true}"
 export PYTHONNOUSERSITE="${PYTHONNOUSERSITE:-1}"
+export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
 
 # Download controls shared by download_OpenNeuro.py and planned future scripts.
 MAX_SIZE_MB="${MAX_SIZE_MB:-0}"          # 0 means unlimited when supported.
-MAX_WORKERS="${MAX_WORKERS:-${SLURM_CPUS_PER_TASK:-8}}"
+MAX_WORKERS="${MAX_WORKERS:-4}"
 DRY_RUN="${DRY_RUN:-false}"
-OPENNEURO_BACKEND="${OPENNEURO_BACKEND:-auto}"  # auto, aws, openneuro
+OPENNEURO_BACKEND="${OPENNEURO_BACKEND:-aws}"  # auto, aws, openneuro
 
 # Optional preprocessing flags. Disable for pure download jobs.
 ENABLE_PREPROCESS="${ENABLE_PREPROCESS:-false}"
