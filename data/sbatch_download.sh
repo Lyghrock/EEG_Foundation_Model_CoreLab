@@ -5,8 +5,8 @@
 # Usage examples:
 #   sbatch sbatch_download.sh
 #   sbatch sbatch_download.sh --dry-run
-#   DATA_SOURCE=physionet sbatch sbatch_download.sh
-#   DATA_SOURCE=openneuro MAX_SIZE_MB=102400 sbatch sbatch_download.sh --dataset ds002778
+#   sbatch sbatch_download.sh --data-source physionet --discover --sort size
+#   sbatch sbatch_download.sh --data-source openneuro --max-size-mb 102400 --dataset ds002778
 #
 # Notes:
 #   - This launcher is intended for H100-style Slurm download jobs.
@@ -30,6 +30,7 @@
 set -euo pipefail
 
 SHARED_EEG_ROOT="${SHARED_EEG_ROOT:-/mnt/ddn/shared/datasets/eeg}"
+EEG_FM_ROOT="${EEG_FM_ROOT:-${SHARED_EEG_ROOT}/eeg_fm}"
 
 resolve_script_dir() {
     # Slurm copies the batch script into its spool directory before execution,
@@ -53,19 +54,32 @@ LAUNCHER_DIR="$(resolve_script_dir)"
 
 # Dataset source selector. Supported: openneuro, physionet, custom.
 DATA_SOURCE="${DATA_SOURCE:-openneuro}"
+PREV_ARG=""
+for ARG in "$@"; do
+    if [ "${PREV_ARG}" = "--data-source" ] || [ "${PREV_ARG}" = "--source" ]; then
+        DATA_SOURCE="${ARG}"
+        PREV_ARG=""
+        continue
+    fi
+    case "${ARG}" in
+        --data-source=*|--source=*) DATA_SOURCE="${ARG#*=}" ;;
+        --data-source|--source) PREV_ARG="${ARG}" ;;
+        *) PREV_ARG="" ;;
+    esac
+done
 
 case "${DATA_SOURCE}" in
     openneuro)
-        DEFAULT_OUTPUT_DIR="/mnt/ddn/shared/datasets/eeg/OpenNeuro"
+        DEFAULT_OUTPUT_DIR="${EEG_FM_ROOT}/OpenNeuro"
         ;;
     physionet)
-        DEFAULT_OUTPUT_DIR="/mnt/ddn/shared/datasets/eeg/PhysioNet"
+        DEFAULT_OUTPUT_DIR="${EEG_FM_ROOT}/PhysioNet"
         ;;
     custom)
-        DEFAULT_OUTPUT_DIR="/mnt/ddn/shared/datasets/eeg/custom"
+        DEFAULT_OUTPUT_DIR="${EEG_FM_ROOT}/custom"
         ;;
     *)
-        DEFAULT_OUTPUT_DIR="/mnt/ddn/shared/datasets/eeg/${DATA_SOURCE}"
+        DEFAULT_OUTPUT_DIR="${EEG_FM_ROOT}/${DATA_SOURCE}"
         ;;
 esac
 
@@ -79,18 +93,21 @@ CUSTOM_DOWNLOAD_SCRIPT="${CUSTOM_DOWNLOAD_SCRIPT:-}"
 
 # Absolute storage/log paths.
 OUTPUT_DIR="${OUTPUT_DIR:-${DEFAULT_OUTPUT_DIR}}"
-LOG_DIR="${LOG_DIR:-${SHARED_EEG_ROOT}/logs/download}"
+LOG_DIR="${LOG_DIR:-${EEG_FM_ROOT}/logs/download}"
 
-# Runtime environment. Set CONDA_ENV="" to skip conda activation.
+# Runtime environment. This launcher does not use conda by default because H100
+# download jobs run under a shared account without interactive conda setup.
 CONDA_SH="${CONDA_SH:-}"
-SHARED_ENV_PYTHON="${SHARED_ENV_PYTHON:-${SHARED_EEG_ROOT}/envs/eeg_fm/bin/python}"
+SHARED_ENV_PYTHON="${SHARED_ENV_PYTHON:-${EEG_FM_ROOT}/venv/bin/python}"
+LEGACY_SHARED_ENV_PYTHON="${LEGACY_SHARED_ENV_PYTHON:-${SHARED_EEG_ROOT}/envs/eeg_fm/bin/python}"
 if [ -z "${PYTHON_BIN+x}" ] && [ -x "${SHARED_ENV_PYTHON}" ]; then
     PYTHON_BIN="${SHARED_ENV_PYTHON}"
-    CONDA_ENV="${CONDA_ENV-}"
+elif [ -z "${PYTHON_BIN+x}" ] && [ -x "${LEGACY_SHARED_ENV_PYTHON}" ]; then
+    PYTHON_BIN="${LEGACY_SHARED_ENV_PYTHON}"
 else
     PYTHON_BIN="${PYTHON_BIN:-python3}"
-    CONDA_ENV="${CONDA_ENV-eeg_fm}"
 fi
+CONDA_ENV="${CONDA_ENV:-}"
 CHECK_IMPORTS="${CHECK_IMPORTS:-true}"
 export PYTHONNOUSERSITE="${PYTHONNOUSERSITE:-1}"
 
@@ -111,6 +128,197 @@ INTERPOLATE_CHANNELS="${INTERPOLATE_CHANNELS:-false}"
 REMOVE_ORIGINAL="${REMOVE_ORIGINAL:-true}"
 
 # =============================================================================
+
+DOWNLOAD_ARGS=()
+
+launcher_usage() {
+    cat <<USAGE
+Usage:
+  sbatch sbatch_download.sh [launcher options] [downloader options]
+
+Launcher options:
+  --data-source openneuro|physionet|custom
+  --output-dir /abs/path
+  --log-dir /abs/path
+  --python-bin /abs/path/python
+  --download-script-dir /abs/path/to/repo/data
+  --max-workers N
+  --max-size-mb N
+  --dry-run
+  --openneuro-backend auto|aws|openneuro
+  --download-backend auto|aws|openneuro
+
+Examples:
+  sbatch sbatch_download.sh --data-source openneuro --openneuro-backend aws --max-workers 2
+  sbatch sbatch_download.sh --data-source physionet --max-workers 4 --discover --sort size
+USAGE
+}
+
+parse_launcher_args() {
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --launcher-help)
+                launcher_usage
+                exit 0
+                ;;
+            --)
+                shift
+                DOWNLOAD_ARGS+=("$@")
+                break
+                ;;
+            --data-source|--source)
+                [ "$#" -ge 2 ] || { echo "[ERROR] $1 requires a value"; exit 1; }
+                DATA_SOURCE="$2"
+                shift 2
+                ;;
+            --data-source=*|--source=*)
+                DATA_SOURCE="${1#*=}"
+                shift
+                ;;
+            --output-dir)
+                [ "$#" -ge 2 ] || { echo "[ERROR] $1 requires a value"; exit 1; }
+                OUTPUT_DIR="$2"
+                shift 2
+                ;;
+            --output-dir=*)
+                OUTPUT_DIR="${1#*=}"
+                shift
+                ;;
+            --log-dir)
+                [ "$#" -ge 2 ] || { echo "[ERROR] $1 requires a value"; exit 1; }
+                LOG_DIR="$2"
+                shift 2
+                ;;
+            --log-dir=*)
+                LOG_DIR="${1#*=}"
+                shift
+                ;;
+            --python-bin)
+                [ "$#" -ge 2 ] || { echo "[ERROR] $1 requires a value"; exit 1; }
+                PYTHON_BIN="$2"
+                shift 2
+                ;;
+            --python-bin=*)
+                PYTHON_BIN="${1#*=}"
+                shift
+                ;;
+            --download-script-dir)
+                [ "$#" -ge 2 ] || { echo "[ERROR] $1 requires a value"; exit 1; }
+                DOWNLOAD_SCRIPT_DIR="$2"
+                REPO_DIR="${DOWNLOAD_SCRIPT_DIR}"
+                OPENNEURO_SCRIPT="${DOWNLOAD_SCRIPT_DIR}/download_OpenNeuro.py"
+                PHYSIONET_SCRIPT="${DOWNLOAD_SCRIPT_DIR}/download_PhysioNet.py"
+                shift 2
+                ;;
+            --download-script-dir=*)
+                DOWNLOAD_SCRIPT_DIR="${1#*=}"
+                REPO_DIR="${DOWNLOAD_SCRIPT_DIR}"
+                OPENNEURO_SCRIPT="${DOWNLOAD_SCRIPT_DIR}/download_OpenNeuro.py"
+                PHYSIONET_SCRIPT="${DOWNLOAD_SCRIPT_DIR}/download_PhysioNet.py"
+                shift
+                ;;
+            --max-workers)
+                [ "$#" -ge 2 ] || { echo "[ERROR] $1 requires a value"; exit 1; }
+                MAX_WORKERS="$2"
+                shift 2
+                ;;
+            --max-workers=*)
+                MAX_WORKERS="${1#*=}"
+                shift
+                ;;
+            --max-size-mb)
+                [ "$#" -ge 2 ] || { echo "[ERROR] $1 requires a value"; exit 1; }
+                MAX_SIZE_MB="$2"
+                shift 2
+                ;;
+            --max-size-mb=*)
+                MAX_SIZE_MB="${1#*=}"
+                shift
+                ;;
+            --dry-run|--dryrun)
+                DRY_RUN=true
+                shift
+                ;;
+            --no-dry-run)
+                DRY_RUN=false
+                shift
+                ;;
+            --openneuro-backend|--download-backend)
+                [ "$#" -ge 2 ] || { echo "[ERROR] $1 requires a value"; exit 1; }
+                OPENNEURO_BACKEND="$2"
+                shift 2
+                ;;
+            --openneuro-backend=*|--download-backend=*)
+                OPENNEURO_BACKEND="${1#*=}"
+                shift
+                ;;
+            --preprocess)
+                ENABLE_PREPROCESS=true
+                shift
+                ;;
+            --no-preprocess)
+                ENABLE_PREPROCESS=false
+                shift
+                ;;
+            --target-fs)
+                [ "$#" -ge 2 ] || { echo "[ERROR] $1 requires a value"; exit 1; }
+                TARGET_FS="$2"
+                shift 2
+                ;;
+            --target-fs=*)
+                TARGET_FS="${1#*=}"
+                shift
+                ;;
+            --target-duration)
+                [ "$#" -ge 2 ] || { echo "[ERROR] $1 requires a value"; exit 1; }
+                TARGET_DURATION="$2"
+                shift 2
+                ;;
+            --target-duration=*)
+                TARGET_DURATION="${1#*=}"
+                shift
+                ;;
+            --length-mode)
+                [ "$#" -ge 2 ] || { echo "[ERROR] $1 requires a value"; exit 1; }
+                LENGTH_MODE="$2"
+                shift 2
+                ;;
+            --length-mode=*)
+                LENGTH_MODE="${1#*=}"
+                shift
+                ;;
+            --standard-channels)
+                [ "$#" -ge 2 ] || { echo "[ERROR] $1 requires a value"; exit 1; }
+                STANDARD_CHANNELS="$2"
+                shift 2
+                ;;
+            --standard-channels=*)
+                STANDARD_CHANNELS="${1#*=}"
+                shift
+                ;;
+            --interpolate-channels)
+                INTERPOLATE_CHANNELS=true
+                shift
+                ;;
+            --no-interpolate-channels)
+                INTERPOLATE_CHANNELS=false
+                shift
+                ;;
+            --remove-original)
+                REMOVE_ORIGINAL=true
+                shift
+                ;;
+            --no-remove-original)
+                REMOVE_ORIGINAL=false
+                shift
+                ;;
+            *)
+                DOWNLOAD_ARGS+=("$1")
+                shift
+                ;;
+        esac
+    done
+}
 
 is_true() {
     case "$1" in
@@ -191,6 +399,7 @@ print_command() {
     echo
 }
 
+parse_launcher_args "$@"
 select_download_script
 
 require_abs_path "${REPO_DIR}" "REPO_DIR"
@@ -273,8 +482,8 @@ if is_true "${ENABLE_PREPROCESS}"; then
     fi
 fi
 
-if [ "$#" -gt 0 ]; then
-    CMD+=("$@")
+if [ "${#DOWNLOAD_ARGS[@]}" -gt 0 ]; then
+    CMD+=("${DOWNLOAD_ARGS[@]}")
 fi
 
 print_command "${CMD[@]}"

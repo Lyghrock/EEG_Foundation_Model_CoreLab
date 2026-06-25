@@ -64,7 +64,7 @@ cp data/sbatch_download.sh \
 
 The launcher is relocatable. By default, it resolves `download_OpenNeuro.py` and
 `download_PhysioNet.py` from the same directory as `sbatch_download.sh`, and logs
-to `/mnt/ddn/shared/datasets/eeg/logs/download`.
+to `/mnt/ddn/shared/datasets/eeg/eeg_fm/logs/download`.
 
 Under Slurm, the batch script may be copied into the scheduler spool directory
 before execution. The launcher therefore prefers `SLURM_SUBMIT_DIR` when that
@@ -80,13 +80,12 @@ cp data/config_physionet.json \
 chmod 600 /mnt/ddn/shared/datasets/eeg/download_scripts/config_physionet.json
 ```
 
-For cross-account Slurm jobs, prefer a conda prefix in the shared tree. This
-avoids relying on interactive shell conda activation:
+For cross-account Slurm jobs, prefer a plain Python/venv environment in the
+shared tree. The launcher does not activate conda by default.
 
 ```bash
-conda create -y -p /mnt/ddn/shared/datasets/eeg/envs/eeg_fm python=3.10
-/mnt/ddn/shared/datasets/eeg/envs/eeg_fm/bin/python -m pip install \
-  -r /mnt/ddn/shared/datasets/eeg/download_scripts/requirements.txt
+/mnt/ddn/shared/datasets/eeg/eeg_fm/venv/bin/python -m pip install \
+  -r /mnt/ddn/shared/datasets/eeg/eeg_fm/repo/requirements.txt
 ```
 
 Submit OpenNeuro from the shared bundle:
@@ -94,10 +93,10 @@ Submit OpenNeuro from the shared bundle:
 ```bash
 cd /mnt/ddn/shared/datasets/eeg/download_scripts
 
-DATA_SOURCE=openneuro \
-MAX_WORKERS=8 \
-MAX_SIZE_MB=0 \
-sbatch sbatch_download.sh
+sbatch sbatch_download.sh \
+  --data-source openneuro \
+  --max-workers 8 \
+  --max-size-mb 0
 ```
 
 Submit PhysioNet from the shared bundle:
@@ -105,20 +104,20 @@ Submit PhysioNet from the shared bundle:
 ```bash
 cd /mnt/ddn/shared/datasets/eeg/download_scripts
 
-DATA_SOURCE=physionet \
-MAX_WORKERS=4 \
-MAX_SIZE_MB=0 \
-sbatch sbatch_download.sh --discover --sort size
+sbatch sbatch_download.sh \
+  --data-source physionet \
+  --max-workers 4 \
+  --max-size-mb 0 \
+  --discover \
+  --sort size
 ```
 
-If `/mnt/ddn/shared/datasets/eeg/envs/eeg_fm/bin/python` exists, the launcher
-uses it automatically and skips `conda activate`. You can still override this
-explicitly:
+If `/mnt/ddn/shared/datasets/eeg/eeg_fm/venv/bin/python` exists, the launcher
+uses it automatically. You can still override this explicitly:
 
 ```bash
-CONDA_ENV="" \
-PYTHON_BIN=/mnt/ddn/shared/datasets/eeg/envs/eeg_fm/bin/python \
-sbatch sbatch_download.sh
+sbatch sbatch_download.sh \
+  --python-bin /mnt/ddn/shared/datasets/eeg/eeg_fm/venv/bin/python
 ```
 
 ## OpenNeuro
@@ -144,38 +143,41 @@ conda run -n eeg_fm python data/download_OpenNeuro.py \
 Default H100 storage through the Slurm launcher:
 
 ```text
-/mnt/ddn/shared/datasets/eeg/OpenNeuro
+/mnt/ddn/shared/datasets/eeg/eeg_fm/OpenNeuro
 ```
 
 Slurm dry-run:
 
 ```bash
-DATA_SOURCE=openneuro DRY_RUN=true sbatch data/sbatch_download.sh
+sbatch data/sbatch_download.sh \
+  --data-source openneuro \
+  --dry-run
 ```
 
 OpenNeuro full download through Slurm:
 
 ```bash
-DATA_SOURCE=openneuro \
-OPENNEURO_BACKEND=auto \
-MAX_WORKERS=8 \
-MAX_SIZE_MB=0 \
-sbatch data/sbatch_download.sh
+sbatch data/sbatch_download.sh \
+  --data-source openneuro \
+  --download-backend auto \
+  --max-workers 8 \
+  --max-size-mb 0
 ```
 
 If OpenNeuro downloads are slow or unstable, prefer the public S3 backend:
 
 ```bash
-DATA_SOURCE=openneuro \
-OPENNEURO_BACKEND=aws \
-MAX_WORKERS=2 \
-MAX_SIZE_MB=0 \
-sbatch data/sbatch_download.sh
+sbatch data/sbatch_download.sh \
+  --data-source openneuro \
+  --download-backend aws \
+  --max-workers 2 \
+  --max-size-mb 0
 ```
 
-`OPENNEURO_BACKEND=auto` uses `awscli` when available and otherwise falls back
+`--download-backend auto` uses `awscli` when available and otherwise falls back
 to `openneuro-py`. AWS CLI also has internal multipart/concurrent transfers, so
-start with `MAX_WORKERS=2` or `4` instead of very high dataset-level parallelism.
+start with `--max-workers 2` or `4` instead of very high dataset-level
+parallelism.
 Interrupted dataset directories are resumed on the next run; only directories
 with `.download_complete.json` are skipped.
 
@@ -244,39 +246,45 @@ conda run -n eeg_fm python data/download_PhysioNet.py \
 Default H100 storage through the Slurm launcher:
 
 ```text
-/mnt/ddn/shared/datasets/eeg/PhysioNet
+/mnt/ddn/shared/datasets/eeg/eeg_fm/PhysioNet
 ```
 
 Slurm PhysioNet discovery dry-run:
 
 ```bash
-DATA_SOURCE=physionet \
-DRY_RUN=true \
-sbatch data/sbatch_download.sh --discover --sort size
+sbatch data/sbatch_download.sh \
+  --data-source physionet \
+  --dry-run \
+  --discover \
+  --sort size
 ```
 
 Slurm PhysioNet discovered batch download:
 
 ```bash
-DATA_SOURCE=physionet \
-MAX_WORKERS=4 \
-MAX_SIZE_MB=0 \
-sbatch data/sbatch_download.sh --discover --sort size
+sbatch data/sbatch_download.sh \
+  --data-source physionet \
+  --max-workers 4 \
+  --max-size-mb 0 \
+  --discover \
+  --sort size
 ```
 
 ## Launcher Notes
 
 `data/sbatch_download.sh` is source-generic and should be configured through
-environment variables:
+launcher arguments. Environment variables are still supported for compatibility,
+but command-line arguments are less error-prone and take precedence:
 
 ```bash
-DATA_SOURCE=openneuro|physionet
-DOWNLOAD_SCRIPT_DIR=/absolute/path/to/download_scripts
-OUTPUT_DIR=/absolute/path/to/data/root
-LOG_DIR=/absolute/path/to/log/root
-CONDA_SH=/absolute/path/to/miniconda3/etc/profile.d/conda.sh
-CONDA_ENV=eeg_fm
-PYTHON_BIN=/absolute/path/to/python
+sbatch data/sbatch_download.sh \
+  --data-source openneuro \
+  --download-script-dir /absolute/path/to/download_scripts \
+  --output-dir /absolute/path/to/data/root \
+  --log-dir /absolute/path/to/log/root \
+  --python-bin /absolute/path/to/python \
+  --max-workers 2 \
+  --max-size-mb 0
 ```
 
 The launcher does not pull git, sync files, or start preprocessing by default.
