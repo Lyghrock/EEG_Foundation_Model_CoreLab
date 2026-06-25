@@ -35,7 +35,15 @@ EEG_FM_ROOT="${EEG_FM_ROOT:-${SHARED_EEG_ROOT}/eeg_fm}"
 resolve_script_dir() {
     # Slurm copies the batch script into its spool directory before execution,
     # so BASH_SOURCE[0] can point at /cm/.../spool/job*/ instead of the submit
-    # directory. Prefer SLURM_SUBMIT_DIR when it contains the downloader files.
+    # directory. Prefer the actual working directory first because sbatch
+    # --chdir changes PWD but not SLURM_SUBMIT_DIR.
+    if ls "$(pwd -P)"/download_*.py >/dev/null 2>&1; then
+        pwd -P
+        return
+    fi
+
+    # If the user submitted from the data directory without --chdir, Slurm also
+    # records that location here.
     if [ -n "${SLURM_SUBMIT_DIR:-}" ] && ls "${SLURM_SUBMIT_DIR}"/download_*.py >/dev/null 2>&1; then
         cd "${SLURM_SUBMIT_DIR}" && pwd -P
         return
