@@ -196,6 +196,16 @@ def categorical_distribution(values: Iterable[Any], total: int | None = None) ->
     return rows
 
 
+def compact_distribution(rows: list[dict[str, Any]], limit: int = 5) -> str:
+    parts = []
+    for row in rows[:limit]:
+        value = row.get("value", "")
+        count = row.get("count", 0)
+        percent = row.get("percent", 0.0)
+        parts.append(f"{value}:{count} ({float(percent):.2f}%)")
+    return "; ".join(parts)
+
+
 def weighted_distribution(values: list[Any], weights: list[float], value_name: str = "value") -> list[dict[str, Any]]:
     totals: defaultdict[str, float] = defaultdict(float)
     for value, weight in zip(values, weights):
@@ -597,7 +607,52 @@ def compute(args: argparse.Namespace) -> dict[str, Any]:
         [{"stem": stem, "version_count": len(versions), "versions": "|".join(sorted(versions))} for stem, versions in version_counter.items() if len(versions) > 1],
     )
 
+    n_channels_summary = numeric_summary(n_channels)
+    n_eeg_channels_summary = numeric_summary(n_eeg_channels)
+    sfreq_summary = numeric_summary(sfreqs)
+    duration_summary = numeric_summary(durations)
+    sequence_summary = numeric_summary(seq_lengths)
     reader_errors = sum(1 for row in raw_rows if row.get("status") == "ERROR")
+    annotation_pair_count = sum(1 for row in pair_rows if row.get("annotation_pairs"))
+    exact_pair_count = sum(1 for row in pair_rows if row.get("exact_stem_pairs"))
+    paired_any = pair_summary.get("paired_any_count", 0)
+    total_size_bytes = int(inventory_summary.get("total_size_bytes") or 0)
+    raw_header_size_bytes = int(inventory_summary.get("raw_eeg_size_bytes") or 0)
+    raw_data_size_bytes = int(inventory_summary.get("raw_data_size_bytes") or raw_header_size_bytes)
+    presentation_row = {
+        "dataset_name": args.dataset_name,
+        "input_root": inventory_summary.get("input_root", ""),
+        "total_size_gb": total_size_bytes / 1_000_000_000,
+        "raw_eeg_header_size_gb": raw_header_size_bytes / 1_000_000_000,
+        "raw_data_size_gb": raw_data_size_bytes / 1_000_000_000,
+        "total_files": inventory_summary.get("total_files", 0),
+        "raw_recordings": len(raw_rows),
+        "readable_raw_recordings": len(readable_rows),
+        "reader_error_count": reader_errors,
+        "inferred_subject_count": inventory_summary.get("inferred_subject_count", 0),
+        "inferred_session_count": inventory_summary.get("inferred_session_count", 0),
+        "total_raw_eeg_hours": total_hours,
+        "raw_formats": compact_distribution(format_dist),
+        "top_level_subsets": compact_distribution(subset_dist),
+        "dominant_sampling_frequencies_hz": compact_distribution(sfreq_value_counts),
+        "n_eeg_channels_median": n_eeg_channels_summary["median"],
+        "n_eeg_channels_min": n_eeg_channels_summary["min"],
+        "n_eeg_channels_max": n_eeg_channels_summary["max"],
+        "recording_duration_sec_median": duration_summary["median"],
+        "recording_duration_sec_mean": duration_summary["mean"],
+        "sequence_length_samples_median": sequence_summary["median"],
+        "sequence_length_samples_mean": sequence_summary["mean"],
+        "estimated_30s_windows": next((row["total_nonoverlap_windows"] for row in window_rows if row["window_sec"] == 30), ""),
+        "recommended_window_lengths_sec": "|".join(str(row["window_sec"]) for row in window_rows if row["percent_usable_recordings"] >= 95),
+        "pair_status_summary": compact_distribution(pair_dist),
+        "paired_any_count": paired_any,
+        "paired_any_percent": paired_any / len(pair_rows) * 100 if pair_rows else 0.0,
+        "exact_stem_pair_count": exact_pair_count,
+        "annotation_pair_count": annotation_pair_count,
+        "annotation_pair_percent": annotation_pair_count / len(pair_rows) * 100 if pair_rows else 0.0,
+    }
+    write_csv(stats_dir / "dataset_presentation_summary.csv", [presentation_row])
+
     stats_summary = {
         "dataset_name": args.dataset_name,
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -607,18 +662,19 @@ def compute(args: argparse.Namespace) -> dict[str, Any]:
         "readable_raw_eeg_files": len(readable_rows),
         "reader_error_count": reader_errors,
         "total_raw_eeg_hours": total_hours,
-        "n_channels_total": numeric_summary(n_channels),
-        "n_eeg_channels": numeric_summary(n_eeg_channels),
-        "sampling_frequency_hz": numeric_summary(sfreqs),
-        "duration_sec": numeric_summary(durations),
-        "sequence_length_samples": numeric_summary(seq_lengths),
+        "dataset_presentation_summary": presentation_row,
+        "n_channels_total": n_channels_summary,
+        "n_eeg_channels": n_eeg_channels_summary,
+        "sampling_frequency_hz": sfreq_summary,
+        "duration_sec": duration_summary,
+        "sequence_length_samples": sequence_summary,
         "quality_flags": {
             "missing_metadata_count": sum(1 for row in raw_rows if not row.get("inferred_subject_id")),
             "zero_duration_count": sum(1 for v in durations if v == 0),
-            "duration_outlier_count": numeric_summary(durations)["outlier_count"],
-            "sampling_frequency_outlier_count": numeric_summary(sfreqs)["outlier_count"],
-            "channel_count_outlier_count": numeric_summary(n_eeg_channels)["outlier_count"],
-            "sequence_length_outlier_count": numeric_summary(seq_lengths)["outlier_count"],
+            "duration_outlier_count": duration_summary["outlier_count"],
+            "sampling_frequency_outlier_count": sfreq_summary["outlier_count"],
+            "channel_count_outlier_count": n_eeg_channels_summary["outlier_count"],
+            "sequence_length_outlier_count": sequence_summary["outlier_count"],
             "reader_error_count": reader_errors,
         },
         "pretraining_readiness": {

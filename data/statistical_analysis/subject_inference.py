@@ -22,6 +22,7 @@ GENERIC_SUB_RE = re.compile(
 )
 GENERIC_SES_RE = re.compile(r"^(?:session|sess|ses|visit)[_-]?([A-Za-z0-9][A-Za-z0-9_.-]*)$", re.IGNORECASE)
 TUH_PATIENT_RE = re.compile(r"^s\d{3,}$", re.IGNORECASE)
+PHYSIONET_CHALLENGE_RECORD_RE = re.compile(r"^(?:tr|te)\d{2}-\d{4}$", re.IGNORECASE)
 
 
 def _first_match(pattern: re.Pattern[str], parts: list[str]) -> str:
@@ -57,6 +58,11 @@ def infer_from_relative_path(relative_path: str | Path) -> dict[str, str]:
     if not subject_id:
         for part in search_parts:
             if TUH_PATIENT_RE.match(part):
+                subject_id = part
+                break
+    if not subject_id:
+        for part in search_parts:
+            if PHYSIONET_CHALLENGE_RECORD_RE.match(part):
                 subject_id = part
                 break
 

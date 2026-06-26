@@ -102,6 +102,7 @@ Output directory:
   pair_summary.json
   statistics_summary.json
   stats_tables/
+    dataset_presentation_summary.csv
     channel_count_distribution.csv
     sampling_frequency_distribution.csv
     duration_summary.csv
@@ -150,8 +151,11 @@ inferred_session_id, inferred_task_id, file_role
 `file_role` should be inferred by suffix/name:
 
 - `raw_eeg`: `.edf`, `.bdf`, `.gdf`, `.vhdr`, `.eeg`, `.set`, `.fif`, `.cnt`
-- `metadata`: `.json`, `.tsv`, `.csv`, `.xlsx`, `.mat`
+- `raw_eeg_component`: `.eeg`, `.dat`, `.fdt`, and WFDB payload `.mat`
+  files when a same-stem `.hea` header exists.
+- `metadata`: `.json`, `.tsv`, `.csv`, `.xlsx`, standalone `.mat`
 - `annotation`: `.tse`, `.lbl`, `.rec`, `.vmrk`, event files, seizure labels
+  and PhysioNet Challenge-style `.arousal` / `*-arousal.mat` labels
 - `text_report`: `.txt`, `.md`, clinical reports
 - `image_or_other`: remaining files
 
@@ -206,8 +210,9 @@ Supported raw EEG formats in first implementation:
 - EDF/EDF+: prefer `pyedflib` when available; fallback to lightweight manual
   EDF header parser.
 - BDF/BDF+: use `pyedflib` or MNE fallback.
-- WFDB `.hea`/`.dat`: parse `.hea` headers directly for sampling rate,
-  signal length, and channel labels; `.dat` remains a raw signal component.
+- WFDB `.hea`/`.dat` and `.hea`/`.mat`: parse `.hea` headers directly for
+  sampling rate, signal length, and channel labels; `.dat`/same-stem `.mat`
+  remain raw signal components.
 - BrainVision: `.vhdr` plus `.eeg`/`.vmrk`, use MNE metadata read.
 - EEGLAB `.set`: use MNE metadata read when installed.
 - FIF: use MNE metadata read.
@@ -271,7 +276,10 @@ Pairing rules:
 
 1. Exact same stem in the same directory:
    `record.edf` with `record.json`, `record.tsv`, `record.csv`,
-   `record.tse`, `record.lbl`, `record.rec`, `record.vmrk`.
+   `record.tse`, `record.lbl`, `record.rec`, `record.vmrk`, `record.mat`,
+   `record.arousal`.
+   PhysioNet Challenge 2018 also uses `record-arousal.mat`; this is normalized
+   to the same raw-record stem for structural pairing.
 2. BIDS-style sidecars inherited from parent directories:
    `participants.tsv`, `sessions.tsv`, `*_scans.tsv`, `*_events.tsv`,
    `dataset_description.json`, task-level JSON sidecars.
@@ -310,6 +318,31 @@ Outputs:
 - table-ready CSV files under `stats_tables/`
 - plot-ready CSV files under `plot_data/`
 - `plot_data/plot_manifest.json`
+
+Paper-style dataset summary:
+
+`stats_tables/dataset_presentation_summary.csv` should produce one row per
+analyzed dataset with fields that can be copied into a pretraining-corpus
+table:
+
+```text
+dataset_name,input_root,total_size_gb,raw_eeg_header_size_gb,
+raw_data_size_gb,total_files,
+raw_recordings,readable_raw_recordings,reader_error_count,
+inferred_subject_count,inferred_session_count,total_raw_eeg_hours,
+raw_formats,top_level_subsets,dominant_sampling_frequencies_hz,
+n_eeg_channels_median,n_eeg_channels_min,n_eeg_channels_max,
+recording_duration_sec_median,recording_duration_sec_mean,
+sequence_length_samples_median,sequence_length_samples_mean,
+estimated_30s_windows,recommended_window_lengths_sec,
+pair_status_summary,paired_any_count,paired_any_percent,
+exact_stem_pair_count,annotation_pair_count,annotation_pair_percent
+```
+
+This follows the presentation pattern used by large EEG-FM papers such as
+DeeperBrain: dataset/source, sampling rate, channel count, duration/window
+scale, sample/record count, and total duration are reported together instead
+of scattered across separate tables.
 
 Important boundary:
 
@@ -481,6 +514,32 @@ Plot rules:
 No automatic generic report builder is planned. The dataset-specific
 `report_{dataset_name}.md` remains an agent-authored semantic report, and the
 script outputs structured CSV/JSON/PNG artifacts for inspection.
+
+## PhysioNet 2018 / DeeperBrain Case Note
+
+The "PhysioNet 2018" entry cited by DeeperBrain refers to the specific
+PhysioNet/Computing in Cardiology Challenge 2018 sleep-arousal dataset, not to
+all EEG datasets hosted on PhysioNet. The general Goldberger et al. PhysioNet
+paper should be treated as the platform citation, while Ghassemi et al.
+"You Snooze, You Win" identifies the 2018 challenge dataset.
+
+This dataset is PSG-like and includes EEG plus auxiliary physiological
+channels. The file structure is WFDB-style: each record has a `.hea` header,
+a same-stem `.mat` signal payload, and arousal/sleep annotation files such as
+`.arousal` and `*-arousal.mat`. For this type of dataset, the generic analysis
+must report:
+
+- WFDB record count and readable header count.
+- Subject count inferred from record folders or official split structure.
+- Sampling frequency, channel names/types, and EEG-vs-auxiliary channel mix.
+- Total raw hours and estimated fixed-window sample counts, especially 30 s
+  windows for sleep datasets.
+- Structural pair completeness of `.hea` to signal payload and annotation
+  files.
+- Label/annotation coverage separately from general metadata coverage.
+
+The dataset-specific `report_PhysioNet_Challenge2018.md` should still explain
+official train/test split semantics and any protected-access requirements.
 
 ## Additional Statistics For EEG-FM Pretraining
 

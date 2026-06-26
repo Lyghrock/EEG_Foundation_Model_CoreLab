@@ -33,6 +33,7 @@ PAIR_SUFFIXES = {
     ".json",
     ".tsv",
     ".csv",
+    ".mat",
     ".tse",
     ".lbl",
     ".rec",
@@ -40,8 +41,9 @@ PAIR_SUFFIXES = {
     ".txt",
     ".edf.seizures",
     ".ann",
+    ".arousal",
 }
-ANNOTATION_SUFFIXES = {".tse", ".lbl", ".rec", ".vmrk", ".edf.seizures", ".ann"}
+ANNOTATION_SUFFIXES = {".tse", ".lbl", ".rec", ".vmrk", ".edf.seizures", ".ann", ".arousal"}
 TEXT_SUFFIXES = {".txt", ".md"}
 GLOBAL_METADATA_NAMES = {
     "dataset_description.json",
@@ -391,7 +393,15 @@ def pair_stem(path: Path | str) -> str:
     for compound_suffix in (".edf.seizures", ".fif.gz"):
         if lower.endswith(compound_suffix):
             return name[: -len(compound_suffix)]
+    for label_suffix in ("-arousal.mat", "_arousal.mat"):
+        if lower.endswith(label_suffix):
+            return name[: -len(label_suffix)]
     return p.stem
+
+
+def is_annotation_pair(path: Path | str, suffix: str) -> bool:
+    name = Path(path).name.lower()
+    return suffix in ANNOTATION_SUFFIXES or name.endswith("-arousal.mat") or name.endswith("_arousal.mat")
 
 
 def ancestors(path: Path) -> list[str]:
@@ -421,7 +431,7 @@ def analyze_pairing(raw_row: dict[str, Any], context: dict[str, Any]) -> dict[st
         suffix = row.get("suffix") or suffix_key(candidate)
         if suffix in PAIR_SUFFIXES:
             exact_pairs.append(candidate)
-        if suffix in ANNOTATION_SUFFIXES:
+        if is_annotation_pair(candidate, suffix):
             annotation_pairs.append(candidate)
         if suffix in TEXT_SUFFIXES:
             text_pairs.append(candidate)

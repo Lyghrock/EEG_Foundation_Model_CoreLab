@@ -29,7 +29,7 @@ DEFAULT_RAW_FORMATS = {
 }
 RAW_COMPONENT_SUFFIXES = {".eeg", ".dat", ".fdt"}
 METADATA_SUFFIXES = {".json", ".tsv", ".csv", ".xlsx", ".xls", ".mat", ".yaml", ".yml"}
-ANNOTATION_SUFFIXES = {".tse", ".lbl", ".rec", ".vmrk", ".evt", ".edf.seizures", ".ann"}
+ANNOTATION_SUFFIXES = {".tse", ".lbl", ".rec", ".vmrk", ".evt", ".edf.seizures", ".ann", ".arousal"}
 TEXT_SUFFIXES = {".txt", ".md", ".rst"}
 
 
@@ -59,6 +59,10 @@ def infer_file_role(path: Path, raw_formats: set[str]) -> str:
     name = path.name.lower()
     if suffix in raw_formats:
         return "raw_eeg"
+    if name.endswith("-arousal.mat") or name.endswith("_arousal.mat"):
+        return "annotation"
+    if suffix == ".mat" and path.with_suffix(".hea").exists():
+        return "raw_eeg_component"
     if suffix in RAW_COMPONENT_SUFFIXES:
         return "raw_eeg_component"
     if suffix in ANNOTATION_SUFFIXES or "annotation" in name or "event" in name or "seizure" in name:
@@ -91,6 +95,7 @@ def build_inventory(args: argparse.Namespace) -> tuple[list[dict[str, object]], 
     tasks: set[str] = set()
     total_size = 0
     raw_size = 0
+    raw_component_size = 0
 
     for idx, path in enumerate(iter_files(root, args.follow_symlinks), 1):
         if args.max_files and idx > args.max_files:
@@ -159,6 +164,8 @@ def build_inventory(args: argparse.Namespace) -> tuple[list[dict[str, object]], 
         if role == "raw_eeg":
             raw_size += size
             subset_raw_counts[subset] += 1
+        if role == "raw_eeg_component":
+            raw_component_size += size
         if inferred["inferred_subject_id"]:
             subjects.add(inferred["inferred_subject_id"])
         if inferred["inferred_session_id"]:
@@ -177,6 +184,9 @@ def build_inventory(args: argparse.Namespace) -> tuple[list[dict[str, object]], 
         "total_size_bytes": total_size,
         "raw_eeg_files": role_counts["raw_eeg"],
         "raw_eeg_size_bytes": raw_size,
+        "raw_eeg_component_files": role_counts["raw_eeg_component"],
+        "raw_eeg_component_size_bytes": raw_component_size,
+        "raw_data_size_bytes": raw_size + raw_component_size,
         "metadata_files": role_counts["metadata"],
         "annotation_files": role_counts["annotation"],
         "text_report_files": role_counts["text_report"],
