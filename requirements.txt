@@ -9,6 +9,7 @@ mne>=1.8
 numpy>=1.26
 scipy>=1.11
 pandas>=2.0
+matplotlib>=3.8
 
 # Optional readers used by MNE for common EEG container formats
 pymatreader>=1.0
