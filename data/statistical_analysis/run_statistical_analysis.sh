@@ -9,7 +9,7 @@ INPUT_ROOT=""
 OUTPUT_ROOT=""
 OUTPUT_DIR=""
 WORKERS="4"
-RAW_FORMATS="edf,bdf,gdf,vhdr,set,fif,fif.gz,cnt,mff"
+RAW_FORMATS="edf,bdf,gdf,vhdr,set,fif,fif.gz,cnt,mff,hea"
 FOLLOW_SYMLINKS="false"
 DEEP_SIGNAL_SCAN="false"
 MAX_FILES="0"
@@ -31,7 +31,7 @@ Required:
 Optional:
   --output-dir PATH         Exact output directory. Overrides --output-root timestamping.
   --workers N              Parallel raw EEG metadata readers. Default: 4.
-  --raw-formats LIST       Comma-separated primary raw formats. Default: edf,bdf,gdf,vhdr,set,fif,fif.gz,cnt,mff.
+  --raw-formats LIST       Comma-separated primary raw formats. Default: edf,bdf,gdf,vhdr,set,fif,fif.gz,cnt,mff,hea.
   --follow-symlinks BOOL   true/false. Default: false.
   --deep-signal-scan BOOL  Reserved for future payload scan. Default: false.
   --max-files N            Smoke-test limit. 0 means all files.

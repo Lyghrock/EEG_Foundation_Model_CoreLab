@@ -83,7 +83,7 @@ Optional arguments:
 
 ```text
 --workers N                 parallel file-level metadata extraction
---raw-formats edf,bdf,vhdr,set,fif,gdf,cnt
+  --raw-formats edf,bdf,vhdr,set,fif,gdf,cnt,hea
 --follow-symlinks true|false
 --deep-signal-scan true|false
 --max-files N               smoke-test limit
@@ -206,6 +206,8 @@ Supported raw EEG formats in first implementation:
 - EDF/EDF+: prefer `pyedflib` when available; fallback to lightweight manual
   EDF header parser.
 - BDF/BDF+: use `pyedflib` or MNE fallback.
+- WFDB `.hea`/`.dat`: parse `.hea` headers directly for sampling rate,
+  signal length, and channel labels; `.dat` remains a raw signal component.
 - BrainVision: `.vhdr` plus `.eeg`/`.vmrk`, use MNE metadata read.
 - EEGLAB `.set`: use MNE metadata read when installed.
 - FIF: use MNE metadata read.

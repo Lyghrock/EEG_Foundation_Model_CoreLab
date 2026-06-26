@@ -27,6 +27,7 @@ DEFAULT_RAW_FORMATS = {
     ".fif.gz",
     ".cnt",
     ".mff",
+    ".hea",
 }
 PAIR_SUFFIXES = {
     ".json",
@@ -218,6 +219,66 @@ def read_edf_like_header(path: Path, file_format: str) -> dict[str, Any]:
     }
 
 
+def read_wfdb_header(path: Path) -> dict[str, Any]:
+    lines = path.read_text(encoding="latin1", errors="replace").splitlines()
+    content = [line.strip() for line in lines if line.strip() and not line.lstrip().startswith("#")]
+    if not content:
+        raise ValueError("empty WFDB header")
+
+    first = content[0].split()
+    if len(first) < 3:
+        raise ValueError("invalid WFDB record header")
+    n_signals = int(first[1])
+    fs_token = first[2].split("/")[0]
+    sfreq = float(fs_token)
+    signal_length = int(first[3]) if len(first) >= 4 and first[3].lstrip("-").isdigit() else None
+    duration_sec = signal_length / sfreq if signal_length is not None and sfreq > 0 else None
+
+    labels: list[str] = []
+    physical_units: list[str] = []
+    for line in content[1 : 1 + n_signals]:
+        fields = line.split()
+        label = " ".join(fields[8:]) if len(fields) > 8 else (fields[-1] if fields else "")
+        labels.append(label)
+        gain_field = fields[2] if len(fields) > 2 else ""
+        unit = ""
+        if "/" in gain_field:
+            unit = gain_field.split("/", 1)[1]
+        physical_units.append(unit)
+
+    while len(labels) < n_signals:
+        labels.append(f"signal_{len(labels)}")
+        physical_units.append("")
+
+    ch_types = [channel_type(label, unit) for label, unit in zip(labels, physical_units)]
+    eeg_count = sum(1 for kind in ch_types if kind == "eeg")
+    warnings: list[str] = []
+    if signal_length is None:
+        warnings.append("missing_signal_length")
+    if sfreq <= 0:
+        warnings.append("invalid_sampling_frequency")
+
+    return {
+        "status": "WARN" if warnings else "OK",
+        "error": "",
+        "format": "wfdb",
+        "n_channels_total": n_signals,
+        "n_eeg_channels": eeg_count,
+        "channel_names": labels,
+        "channel_types": ch_types,
+        "sampling_frequency_hz_min": sfreq,
+        "sampling_frequency_hz_max": sfreq,
+        "sampling_frequency_hz_mode": sfreq,
+        "duration_sec": duration_sec,
+        "sequence_length_min": signal_length,
+        "sequence_length_max": signal_length,
+        "sequence_length_mode": signal_length,
+        "physical_units": sorted(set(x for x in physical_units if x)),
+        "start_datetime": "",
+        "header_warnings": warnings,
+    }
+
+
 def read_mne_header(path: Path, file_format: str) -> dict[str, Any]:
     try:
         import mne
@@ -270,6 +331,8 @@ def read_raw_eeg_metadata(path: Path, suffix: str) -> dict[str, Any]:
             return read_edf_like_header(path, "edf")
         if suffix == ".bdf":
             return read_edf_like_header(path, "bdf")
+        if suffix == ".hea":
+            return read_wfdb_header(path)
         return read_mne_header(path, suffix)
     except Exception as exc:
         return {
@@ -313,12 +376,22 @@ def build_pair_context(inventory_rows: list[dict[str, str]]) -> dict[str, Any]:
     for row in inventory_rows:
         rel = row["relative_path"]
         path = Path(rel)
-        key = (str(path.parent), path.stem)
+        key = (str(path.parent), pair_stem(path))
         by_dir_stem[key].append(row)
         by_dir[str(path.parent)].append(row)
         if path.name in GLOBAL_METADATA_NAMES or path.name.lower() in {x.lower() for x in GLOBAL_METADATA_NAMES}:
             global_metadata.append(rel)
     return {"by_dir_stem": by_dir_stem, "by_dir": by_dir, "global_metadata": sorted(set(global_metadata))}
+
+
+def pair_stem(path: Path | str) -> str:
+    p = Path(path)
+    name = p.name
+    lower = name.lower()
+    for compound_suffix in (".edf.seizures", ".fif.gz"):
+        if lower.endswith(compound_suffix):
+            return name[: -len(compound_suffix)]
+    return p.stem
 
 
 def ancestors(path: Path) -> list[str]:
@@ -335,7 +408,7 @@ def analyze_pairing(raw_row: dict[str, Any], context: dict[str, Any]) -> dict[st
     rel = raw_row["relative_path"]
     raw_path = Path(rel)
     raw_suffix = suffix_key(raw_path)
-    same_stem = context["by_dir_stem"].get((str(raw_path.parent), raw_path.stem), [])
+    same_stem = context["by_dir_stem"].get((str(raw_path.parent), pair_stem(raw_path)), [])
     exact_pairs: list[str] = []
     annotation_pairs: list[str] = []
     text_pairs: list[str] = []

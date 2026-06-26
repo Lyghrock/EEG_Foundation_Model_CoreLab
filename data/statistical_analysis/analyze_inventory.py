@@ -25,6 +25,7 @@ DEFAULT_RAW_FORMATS = {
     ".fif.gz",
     ".cnt",
     ".mff",
+    ".hea",
 }
 RAW_COMPONENT_SUFFIXES = {".eeg", ".dat", ".fdt"}
 METADATA_SUFFIXES = {".json", ".tsv", ".csv", ".xlsx", ".xls", ".mat", ".yaml", ".yml"}
