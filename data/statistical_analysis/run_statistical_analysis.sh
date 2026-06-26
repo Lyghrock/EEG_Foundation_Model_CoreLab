@@ -29,6 +29,7 @@ Required:
   --output-root PATH        Parent directory for timestamped analysis output.
 
 Optional:
+  --python-bin PATH        Python executable to run analysis scripts. Default: python3 or PYTHON_BIN.
   --output-dir PATH         Exact output directory. Overrides --output-root timestamping.
   --workers N              Parallel raw EEG metadata readers. Default: 4.
   --raw-formats LIST       Comma-separated primary raw formats. Default: edf,bdf,gdf,vhdr,set,fif,fif.gz,cnt,mff,hea.
@@ -45,6 +46,7 @@ while [[ $# -gt 0 ]]; do
     --input-root) INPUT_ROOT="$2"; shift 2 ;;
     --output-root) OUTPUT_ROOT="$2"; shift 2 ;;
     --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
+    --python-bin) PYTHON_BIN="$2"; shift 2 ;;
     --workers) WORKERS="$2"; shift 2 ;;
     --raw-formats) RAW_FORMATS="$2"; shift 2 ;;
     --follow-symlinks) FOLLOW_SYMLINKS="$2"; shift 2 ;;
@@ -63,6 +65,10 @@ if [[ -z "$DATASET_NAME" || -z "$INPUT_ROOT" || -z "$OUTPUT_ROOT$OUTPUT_DIR" ]];
 fi
 if [[ ! -d "$INPUT_ROOT" ]]; then
   echo "[ERROR] Input root does not exist: $INPUT_ROOT" >&2
+  exit 2
+fi
+if [[ "$PYTHON_BIN" == */* && ! -x "$PYTHON_BIN" ]]; then
+  echo "[ERROR] Python executable is not executable: $PYTHON_BIN" >&2
   exit 2
 fi
 
