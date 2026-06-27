@@ -145,7 +145,7 @@ conda run -n eeg_fm python data/download_OpenNeuro.py \
 Default H100 storage through the Slurm launcher:
 
 ```text
-/mnt/ddn/shared/datasets/eeg/eeg_fm/OpenNeuro
+/mnt/ddn/shared/datasets/eeg/OpenNeuro
 ```
 
 Slurm dry-run:
@@ -248,10 +248,122 @@ conda run -n eeg_fm python data/download_PhysioNet.py \
   --output-dir /mnt/ddn/shared/datasets/eeg/PhysioNet
 ```
 
+## PhysioNet Challenge 2018
+
+DeeperBrain's "PhysioNet 2018" entry refers to the specific
+PhysioNet/Computing in Cardiology Challenge 2018 sleep arousal dataset:
+
+```text
+challenge-2018/1.0.0
+```
+
+This repo pins that dataset in:
+
+```text
+data/download_lists/physionet_challenge2018.txt
+```
+
+Because this dataset has been manually verified as EEG-containing PSG data, the
+PhysioNet downloader includes a curated allowlist fallback for
+`challenge-2018/1.0.0` when the metadata page is temporarily unreachable. This
+does not relax automatic discovery for other PhysioNet datasets.
+
+It should be downloaded through the same `sbatch_download.sh` PhysioNet flow as
+other PhysioNet datasets. The expected H100 output location is:
+
+```text
+/mnt/ddn/shared/datasets/eeg/PhysioNet/challenge-2018/1.0.0
+```
+
+Dry-run validation through Slurm:
+
+```bash
+BASE=/mnt/ddn/shared/datasets/eeg/eeg_fm
+mkdir -p /mnt/ddn/shared/datasets/eeg/logs/slurm \
+         /mnt/ddn/shared/datasets/eeg/logs/download \
+         /mnt/ddn/shared/datasets/eeg/PhysioNet
+
+cd $BASE/repo/data
+
+sbatch \
+  --chdir=$BASE/repo/data \
+  --output=/mnt/ddn/shared/datasets/eeg/logs/slurm/physionet2018-%j.out \
+  --error=/mnt/ddn/shared/datasets/eeg/logs/slurm/physionet2018-%j.err \
+  sbatch_download.sh \
+  --data-source physionet \
+  --python-bin $BASE/venv/bin/python \
+  --download-script-dir $BASE/repo/data \
+  --output-dir /mnt/ddn/shared/datasets/eeg/PhysioNet \
+  --log-dir /mnt/ddn/shared/datasets/eeg/logs/download \
+  --max-workers 1 \
+  --max-size-mb 0 \
+  --dry-run \
+  --datasets-file $BASE/repo/data/download_lists/physionet_challenge2018.txt \
+  --sort size
+```
+
+Full download through Slurm:
+
+```bash
+BASE=/mnt/ddn/shared/datasets/eeg/eeg_fm
+mkdir -p /mnt/ddn/shared/datasets/eeg/logs/slurm \
+         /mnt/ddn/shared/datasets/eeg/logs/download \
+         /mnt/ddn/shared/datasets/eeg/PhysioNet
+
+cd $BASE/repo/data
+
+sbatch \
+  --chdir=$BASE/repo/data \
+  --output=/mnt/ddn/shared/datasets/eeg/logs/slurm/physionet2018-%j.out \
+  --error=/mnt/ddn/shared/datasets/eeg/logs/slurm/physionet2018-%j.err \
+  sbatch_download.sh \
+  --data-source physionet \
+  --python-bin $BASE/venv/bin/python \
+  --download-script-dir $BASE/repo/data \
+  --output-dir /mnt/ddn/shared/datasets/eeg/PhysioNet \
+  --log-dir /mnt/ddn/shared/datasets/eeg/logs/download \
+  --max-workers 1 \
+  --max-size-mb 0 \
+  --datasets-file $BASE/repo/data/download_lists/physionet_challenge2018.txt \
+  --sort size
+```
+
+The downloader will create:
+
+```text
+/mnt/ddn/shared/datasets/eeg/PhysioNet/challenge-2018/1.0.0/.download_complete.json
+```
+
+after a successful run. Later runs skip the dataset when this marker exists.
+
+After download, run the dataset-specific statistical-analysis wrapper from the
+cloned repo:
+
+```bash
+cd /mnt/ddn/shared/datasets/eeg/eeg_fm/repo
+bash data/statistical_analysis/run_physionet_challenge2018_analysis.sh
+```
+
+The wrapper expands to the generic analysis command:
+
+```bash
+bash data/statistical_analysis/run_statistical_analysis.sh \
+  --python-bin /mnt/ddn/shared/datasets/eeg/eeg_fm/venv/bin/python \
+  --dataset-name PhysioNet_Challenge2018 \
+  --input-root /mnt/ddn/shared/datasets/eeg/PhysioNet/challenge-2018/1.0.0 \
+  --output-root /mnt/ddn/shared/datasets/eeg/statistical_reports \
+  --workers 8 \
+  --raw-formats hea
+```
+
+Use `--raw-formats hea` for this dataset. The `.mat` files are WFDB signal
+payload components paired with `.hea` headers, not independent raw-record
+entries.
+
 Default H100 storage through the Slurm launcher:
 
 ```text
-/mnt/ddn/shared/datasets/eeg/eeg_fm/PhysioNet
+/mnt/ddn/shared/datasets/eeg/PhysioNet
 ```
 
 Slurm PhysioNet discovery dry-run:

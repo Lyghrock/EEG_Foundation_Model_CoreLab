@@ -89,6 +89,16 @@ CONTENT_SLUG_PATH_RE = re.compile(
     r"^/content/([A-Za-z0-9_.-]+)/?$",
     re.IGNORECASE,
 )
+KNOWN_EEG_DATASETS = {
+    "challenge-2018/1.0.0": {
+        "title": "You Snooze, You Win: the PhysioNet/Computing in Cardiology Challenge 2018",
+        "access": "open-access",
+        "eeg_evidence": (
+            "curated allowlist: PhysioNet/CinC Challenge 2018 is a PSG sleep-arousal "
+            "dataset with EEG channels plus auxiliary physiological channels"
+        ),
+    },
+}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -163,6 +173,25 @@ class Printer:
             return
         with self._lock:
             print(message, flush=True)
+
+
+def known_eeg_info(spec: DatasetSpec, note: str = "") -> DatasetInfo | None:
+    known = KNOWN_EEG_DATASETS.get(spec.id)
+    if not known:
+        return None
+    evidence = known["eeg_evidence"]
+    if note:
+        evidence = f"{evidence}; fallback reason: {note}"
+    return DatasetInfo(
+        spec=spec,
+        title=known["title"],
+        access=known["access"],
+        size_bytes=int(known.get("size_bytes", 0) or 0),
+        is_eeg=True,
+        eeg_evidence=evidence,
+        content_url=spec.content_url,
+        files_url=spec.files_url,
+    )
 
 
 def strip_html(raw_html: str) -> str:
@@ -492,10 +521,16 @@ def resolve_dataset(
     try:
         status, content_html = fetch_text(session, spec.content_url)
     except RuntimeError as exc:
+        known = known_eeg_info(spec, note=f"content page request failed: {exc}")
+        if known is not None:
+            return known
         info.reject_reason = f"content page request failed: {exc}"
         return info
 
     if status >= 400:
+        known = known_eeg_info(spec, note=f"content page HTTP {status}")
+        if known is not None:
+            return known
         info.reject_reason = f"content page HTTP {status}"
         return info
 
@@ -517,6 +552,12 @@ def resolve_dataset(
         info.is_eeg = True
         info.eeg_evidence = evidence
         return info
+
+    known = known_eeg_info(spec, note="official page did not provide parseable EEG evidence")
+    if known is not None:
+        known.size_bytes = info.size_bytes
+        known.access = info.access if info.access != "unknown" else known.access
+        return known
 
     negative = NEGATIVE_MODALITY_RE.search(content_text)
     if negative:
