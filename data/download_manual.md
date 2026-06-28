@@ -209,7 +209,8 @@ conda run -n eeg_fm python data/download_PhysioNet.py \
   --dry-run
 ```
 
-Discover EEG-related PhysioNet datasets from the official database list:
+Discover EEG-related PhysioNet datasets from the official database list, the
+PhysioNet challenge list, and curated known EEG entries:
 
 ```bash
 conda run -n eeg_fm python data/download_PhysioNet.py \
@@ -226,6 +227,70 @@ conda run -n eeg_fm python data/download_PhysioNet.py \
   --discover \
   --dry-run \
   --show-rejected
+```
+
+Check whether `challenge-2018/1.0.0` is included by the total PhysioNet
+discovery flow:
+
+```bash
+PY=/mnt/ddn/shared/datasets/eeg/eeg_fm/venv/bin/python
+REPO=/mnt/ddn/shared/datasets/eeg/eeg_fm/repo
+OUT=/tmp/physionet_eeg_discovered.txt
+
+cd "$REPO"
+"$PY" data/download_PhysioNet.py \
+  --discover \
+  --dry-run \
+  --sort name \
+  --resolve-workers 4 \
+  --write-eeg-list "$OUT"
+
+grep -n '^challenge-2018/1.0.0' "$OUT"
+```
+
+For comparison, this checks the old database-only behavior. It may miss
+`challenge-2018/1.0.0`, because that dataset is listed under PhysioNet
+challenges rather than the normal database page:
+
+```bash
+PY=/mnt/ddn/shared/datasets/eeg/eeg_fm/venv/bin/python
+REPO=/mnt/ddn/shared/datasets/eeg/eeg_fm/repo
+OUT=/tmp/physionet_eeg_database_only.txt
+
+cd "$REPO"
+"$PY" data/download_PhysioNet.py \
+  --discover \
+  --no-discover-challenges \
+  --no-include-known-eeg \
+  --dry-run \
+  --sort name \
+  --resolve-workers 4 \
+  --write-eeg-list "$OUT"
+
+grep -n '^challenge-2018/1.0.0' "$OUT" || \
+  echo 'challenge-2018/1.0.0 not found by database-only discovery'
+```
+
+This checks the official challenge-list path only, without the curated known
+EEG fallback:
+
+```bash
+PY=/mnt/ddn/shared/datasets/eeg/eeg_fm/venv/bin/python
+REPO=/mnt/ddn/shared/datasets/eeg/eeg_fm/repo
+OUT=/tmp/physionet_eeg_challenges_only.txt
+
+cd "$REPO"
+"$PY" data/download_PhysioNet.py \
+  --discover \
+  --discover-url https://physionet.org/about/challenge/moody-challenge \
+  --no-discover-challenges \
+  --no-include-known-eeg \
+  --dry-run \
+  --sort name \
+  --resolve-workers 4 \
+  --write-eeg-list "$OUT"
+
+grep -n '^challenge-2018/1.0.0' "$OUT"
 ```
 
 Download all discovered EEG-validated PhysioNet datasets:

@@ -46,6 +46,7 @@ import requests
 
 PHYSIONET_BASE = "https://physionet.org"
 DATABASE_URL = f"{PHYSIONET_BASE}/about/database/"
+CHALLENGE_URL = f"{PHYSIONET_BASE}/about/challenge/moody-challenge"
 DEFAULT_VERSION = "1.0.0"
 PAGE_TIMEOUT = 60
 WGET_CUT_DIRS = "3"  # files/<slug>/<version>/...
@@ -60,12 +61,26 @@ EEG_CONTEXT_RE = re.compile(
     r"brain[- ]computer|evoked|imagery|headband|spectra",
     re.IGNORECASE,
 )
+EEG_STRONG_CONTEXT_RE = re.compile(
+    r"scalp|polysomno|PSG|sleep|seizure|BCI|brain[- ]computer|"
+    r"evoked|imagery|headband|neuro|EEG\s+channels?",
+    re.IGNORECASE,
+)
 EEG_CITATION_RE = re.compile(
     r"\bdoi\b|citation|references?|article|journal|proceedings|"
     r"@article|bibliography",
     re.IGNORECASE,
 )
 NON_EEG_RE = re.compile(r"\bnon[- ]?eeg\b", re.IGNORECASE)
+INCIDENTAL_EEG_RE = re.compile(
+    r"not\s+acquired\s+as\s+indicators?\s+of\s+cardiac\s+activity|"
+    r"such\s+as\s+EEG\s+signals?",
+    re.IGNORECASE,
+)
+CARDIAC_CONTEXT_RE = re.compile(
+    r"\bECG\b|electrocardiogram|electrocardiography|cardiac|heart\s*beats?|arrhythm",
+    re.IGNORECASE,
+)
 NEGATIVE_MODALITY_RE = re.compile(
     r"\bECG\b|electrocardiogram|electrocardiography",
     re.IGNORECASE,
@@ -192,6 +207,26 @@ def known_eeg_info(spec: DatasetSpec, note: str = "") -> DatasetInfo | None:
         content_url=spec.content_url,
         files_url=spec.files_url,
     )
+
+
+def known_eeg_specs() -> list[DatasetSpec]:
+    specs = []
+    for dataset_id in sorted(KNOWN_EEG_DATASETS):
+        slug, version = dataset_id.split("/", 1)
+        specs.append(DatasetSpec(slug=slug, version=version))
+    return specs
+
+
+def append_unique_specs(specs: list[DatasetSpec], new_specs: list[DatasetSpec]) -> int:
+    seen = {spec.id for spec in specs}
+    added = 0
+    for spec in new_specs:
+        if spec.id in seen:
+            continue
+        specs.append(spec)
+        seen.add(spec.id)
+        added += 1
+    return added
 
 
 def strip_html(raw_html: str) -> str:
@@ -496,6 +531,10 @@ def find_eeg_evidence(text: str, source: str) -> str:
 
 def is_acceptable_eeg_evidence(snippet: str, source: str) -> bool:
     if NON_EEG_RE.search(snippet):
+        return False
+    if INCIDENTAL_EEG_RE.search(snippet):
+        return False
+    if CARDIAC_CONTEXT_RE.search(snippet) and not EEG_STRONG_CONTEXT_RE.search(snippet):
         return False
     if source == "title":
         return True
@@ -901,12 +940,28 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--discover",
         action="store_true",
-        help="Discover all PhysioNet projects from the official database page, then keep EEG-validated datasets.",
+        help=(
+            "Discover PhysioNet projects from the official database page, "
+            "the challenge list unless disabled, and curated known EEG entries; "
+            "then keep EEG-validated datasets."
+        ),
     )
     parser.add_argument(
         "--discover-url",
         default=DATABASE_URL,
         help=f"Discovery source page (default: {DATABASE_URL}).",
+    )
+    parser.add_argument(
+        "--discover-challenges",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=f"Also discover project links from the PhysioNet challenge list (default: true; {CHALLENGE_URL}).",
+    )
+    parser.add_argument(
+        "--include-known-eeg",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="In --discover mode, include curated known EEG PhysioNet datasets such as challenge-2018/1.0.0.",
     )
     parser.add_argument(
         "--discover-limit",
@@ -1023,23 +1078,34 @@ def main() -> int:
     try:
         specs = read_dataset_specs(args)
         if args.discover:
-            discovered = discover_dataset_specs(
-                session,
-                args.discover_url,
-                default_version=args.default_version,
-                workers=args.resolve_workers,
-                limit=args.discover_limit,
-            )
-            print(
-                f"[DISCOVER] found {len(discovered)} PhysioNet project links from "
-                f"{args.discover_url}",
-                file=sys.stderr,
-            )
-            seen = {spec.id for spec in specs}
-            for spec in discovered:
-                if spec.id not in seen:
-                    specs.append(spec)
-                    seen.add(spec.id)
+            discovery_sources = [("primary", args.discover_url)]
+            if args.discover_challenges:
+                discovery_sources.append(("challenges", CHALLENGE_URL))
+            discovery_errors: list[str] = []
+            for source_name, source_url in discovery_sources:
+                try:
+                    discovered = discover_dataset_specs(
+                        session,
+                        source_url,
+                        default_version=args.default_version,
+                        workers=args.resolve_workers,
+                        limit=args.discover_limit,
+                    )
+                except RuntimeError as exc:
+                    discovery_errors.append(f"{source_name}: {exc}")
+                    print(f"[WARN] discovery source failed ({source_name}): {exc}", file=sys.stderr)
+                    continue
+                added = append_unique_specs(specs, discovered)
+                print(
+                    f"[DISCOVER] found {len(discovered)} PhysioNet project links "
+                    f"from {source_name} ({source_url}); added {added}",
+                    file=sys.stderr,
+                )
+            if args.include_known_eeg:
+                added = append_unique_specs(specs, known_eeg_specs())
+                print(f"[DISCOVER] added {added} curated known EEG dataset specs", file=sys.stderr)
+            if discovery_errors and not specs:
+                raise RuntimeError("; ".join(discovery_errors))
         if not specs:
             raise ValueError("provide --dataset, --url, --datasets-file, or --discover")
     except (ValueError, RuntimeError) as exc:
