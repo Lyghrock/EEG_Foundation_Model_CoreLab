@@ -299,6 +299,12 @@ def duration_hours(row: dict[str, str]) -> float:
     return duration / 3600 if duration is not None else 0.0
 
 
+def split_pipe(value: Any) -> list[str]:
+    if value is None:
+        return []
+    return [item for item in str(value).split("|") if item]
+
+
 def write_numeric_artifacts(metric: str, values: list[float], stats_dir: Path, plot_dir: Path, manifest: list[dict[str, Any]], unit: str, log_scale: bool = False) -> None:
     write_csv(stats_dir / f"{metric}_summary.csv", [numeric_summary(values)])
     hist = histogram_rows(values, bins="auto", prefix="bin")
@@ -368,6 +374,17 @@ def compute(args: argparse.Namespace) -> dict[str, Any]:
     n_eeg_channels = [to_int(row.get("n_eeg_channels")) for row in readable_rows]
     sfreqs = [to_float(row.get("sampling_frequency_hz_mode")) for row in readable_rows]
     seq_lengths = [to_float(row.get("sequence_length_mode")) for row in readable_rows]
+    file_sizes = [to_float(row.get("size_bytes")) for row in readable_rows]
+    bytes_per_hour = []
+    bytes_per_sample_channel = []
+    for row in readable_rows:
+        size = to_float(row.get("size_bytes"))
+        duration = to_float(row.get("duration_sec"))
+        seq_len = to_float(row.get("sequence_length_mode"))
+        channels = to_float(row.get("n_channels_total"))
+        bytes_per_hour.append(size / (duration / 3600) if size is not None and duration and duration > 0 else None)
+        denom = (seq_len or 0) * (channels or 0)
+        bytes_per_sample_channel.append(size / denom if size is not None and denom > 0 else None)
 
     channel_dist = categorical_distribution(n_eeg_channels)
     write_csv(stats_dir / "channel_count_distribution.csv", channel_dist, ["value", "count", "percent"])
@@ -391,6 +408,17 @@ def compute(args: argparse.Namespace) -> dict[str, Any]:
     write_numeric_artifacts("sampling_frequency", [v for v in sfreqs if v is not None], stats_dir, plot_data_dir, manifest, "Hz")
     write_numeric_artifacts("duration", durations_valid, stats_dir, plot_data_dir, manifest, "sec", log_scale=True)
     write_numeric_artifacts("sequence_length", [v for v in seq_lengths if v is not None], stats_dir, plot_data_dir, manifest, "samples", log_scale=True)
+    write_numeric_artifacts("raw_file_size_bytes", [v for v in file_sizes if v is not None], stats_dir, plot_data_dir, manifest, "bytes", log_scale=True)
+    write_numeric_artifacts("bytes_per_hour", [v for v in bytes_per_hour if v is not None], stats_dir, plot_data_dir, manifest, "bytes/hour", log_scale=True)
+    write_numeric_artifacts(
+        "bytes_per_sample_channel",
+        [v for v in bytes_per_sample_channel if v is not None],
+        stats_dir,
+        plot_data_dir,
+        manifest,
+        "bytes/sample/channel",
+        log_scale=True,
+    )
 
     format_dist = categorical_distribution([row.get("file_format", "") for row in raw_rows])
     subset_dist = categorical_distribution([source_or_subset(row) for row in raw_rows])
@@ -419,6 +447,39 @@ def compute(args: argparse.Namespace) -> dict[str, Any]:
                 "output_png": f"{name}.png",
             }
         )
+
+    status_dist = categorical_distribution([row.get("status", "") for row in raw_rows])
+    write_csv(stats_dir / "raw_reader_status_distribution.csv", status_dist)
+    channel_type_counter: Counter[str] = Counter()
+    unit_counter: Counter[str] = Counter()
+    warning_counter: Counter[str] = Counter()
+    start_datetime_counter: Counter[str] = Counter()
+    for row in raw_rows:
+        channel_type_counter.update(split_pipe(row.get("channel_types")))
+        unit_counter.update(split_pipe(row.get("physical_units")))
+        warnings = split_pipe(row.get("header_warnings"))
+        if warnings:
+            warning_counter.update(warnings)
+        else:
+            warning_counter["<none>"] += 1
+        start_value = row.get("start_datetime") or "<missing>"
+        start_datetime_counter[start_value] += 1
+    write_csv(
+        stats_dir / "channel_type_distribution.csv",
+        [{"channel_type": key, "count": val} for key, val in channel_type_counter.most_common()],
+    )
+    write_csv(
+        stats_dir / "physical_unit_distribution.csv",
+        [{"physical_unit": key, "count": val} for key, val in unit_counter.most_common()],
+    )
+    write_csv(
+        stats_dir / "header_warning_distribution.csv",
+        [{"header_warning": key, "count": val} for key, val in warning_counter.most_common()],
+    )
+    write_csv(
+        stats_dir / "start_datetime_distribution.csv",
+        [{"start_datetime": key, "recordings": val} for key, val in start_datetime_counter.most_common()],
+    )
 
     subject_hours: defaultdict[str, float] = defaultdict(float)
     subject_records: Counter[str] = Counter()
@@ -612,6 +673,78 @@ def compute(args: argparse.Namespace) -> dict[str, Any]:
     sfreq_summary = numeric_summary(sfreqs)
     duration_summary = numeric_summary(durations)
     sequence_summary = numeric_summary(seq_lengths)
+    file_size_summary = numeric_summary(file_sizes)
+    bytes_per_hour_summary = numeric_summary(bytes_per_hour)
+    bytes_per_sample_channel_summary = numeric_summary(bytes_per_sample_channel)
+
+    quality_rows: list[dict[str, Any]] = []
+    for row in raw_rows:
+        flags: list[str] = []
+        status = row.get("status", "")
+        duration = to_float(row.get("duration_sec"))
+        sfreq_min = to_float(row.get("sampling_frequency_hz_min"))
+        sfreq_max = to_float(row.get("sampling_frequency_hz_max"))
+        sfreq_mode = to_float(row.get("sampling_frequency_hz_mode"))
+        channels_total = to_int(row.get("n_channels_total"))
+        channels_eeg = to_int(row.get("n_eeg_channels"))
+        seq_len = to_float(row.get("sequence_length_mode"))
+        size = to_float(row.get("size_bytes"))
+        warnings = split_pipe(row.get("header_warnings"))
+        if status == "ERROR":
+            flags.append("reader_error")
+        if status == "WARN":
+            flags.append("reader_warning")
+        if warnings:
+            flags.append("header_warning")
+        if duration is None:
+            flags.append("missing_duration")
+        elif duration <= 0:
+            flags.append("nonpositive_duration")
+        if sfreq_mode is None:
+            flags.append("missing_sampling_frequency")
+        elif sfreq_mode <= 0:
+            flags.append("nonpositive_sampling_frequency")
+        if sfreq_min is not None and sfreq_max is not None and abs(sfreq_max - sfreq_min) > 1e-6:
+            flags.append("mixed_sampling_frequency")
+        if channels_total is None or channels_total <= 0:
+            flags.append("missing_or_zero_channels")
+        if channels_eeg is None:
+            flags.append("missing_eeg_channel_count")
+        elif channels_eeg <= 0:
+            flags.append("zero_eeg_channels")
+        if seq_len is None:
+            flags.append("missing_sequence_length")
+        elif seq_len <= 0:
+            flags.append("nonpositive_sequence_length")
+        if size is None or size <= 0:
+            flags.append("missing_or_empty_file")
+        quality_rows.append(
+            {
+                "relative_path": row.get("relative_path", ""),
+                "file_format": row.get("file_format", ""),
+                "status": status,
+                "quality_flags": "|".join(flags) if flags else "ok",
+                "quality_flag_count": len(flags),
+                "duration_sec": row.get("duration_sec", ""),
+                "sampling_frequency_hz_mode": row.get("sampling_frequency_hz_mode", ""),
+                "n_channels_total": row.get("n_channels_total", ""),
+                "n_eeg_channels": row.get("n_eeg_channels", ""),
+                "sequence_length_mode": row.get("sequence_length_mode", ""),
+                "size_bytes": row.get("size_bytes", ""),
+                "header_warnings": row.get("header_warnings", ""),
+                "error": row.get("error", ""),
+            }
+        )
+    write_csv(stats_dir / "record_level_quality_flags.csv", quality_rows)
+    flag_counter: Counter[str] = Counter()
+    for row in quality_rows:
+        for flag in split_pipe(row["quality_flags"]):
+            flag_counter[flag] += 1
+    write_csv(
+        stats_dir / "record_quality_flag_distribution.csv",
+        [{"quality_flag": key, "recordings": val, "percent": val / len(raw_rows) * 100 if raw_rows else 0.0} for key, val in flag_counter.most_common()],
+    )
+
     reader_errors = sum(1 for row in raw_rows if row.get("status") == "ERROR")
     annotation_pair_count = sum(1 for row in pair_rows if row.get("annotation_pairs"))
     exact_pair_count = sum(1 for row in pair_rows if row.get("exact_stem_pairs"))
@@ -668,9 +801,22 @@ def compute(args: argparse.Namespace) -> dict[str, Any]:
         "sampling_frequency_hz": sfreq_summary,
         "duration_sec": duration_summary,
         "sequence_length_samples": sequence_summary,
+        "raw_file_size_bytes": file_size_summary,
+        "bytes_per_hour": bytes_per_hour_summary,
+        "bytes_per_sample_channel": bytes_per_sample_channel_summary,
         "quality_flags": {
             "missing_metadata_count": sum(1 for row in raw_rows if not row.get("inferred_subject_id")),
             "zero_duration_count": sum(1 for v in durations if v == 0),
+            "missing_duration_count": sum(1 for v in durations if v is None),
+            "mixed_sampling_frequency_count": sum(
+                1
+                for row in readable_rows
+                if (to_float(row.get("sampling_frequency_hz_min")) is not None)
+                and (to_float(row.get("sampling_frequency_hz_max")) is not None)
+                and abs((to_float(row.get("sampling_frequency_hz_max")) or 0) - (to_float(row.get("sampling_frequency_hz_min")) or 0)) > 1e-6
+            ),
+            "zero_eeg_channel_count": sum(1 for row in raw_rows if (to_int(row.get("n_eeg_channels")) or 0) == 0),
+            "header_warning_count": sum(1 for row in raw_rows if row.get("header_warnings")),
             "duration_outlier_count": duration_summary["outlier_count"],
             "sampling_frequency_outlier_count": sfreq_summary["outlier_count"],
             "channel_count_outlier_count": n_eeg_channels_summary["outlier_count"],

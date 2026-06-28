@@ -47,6 +47,14 @@ import requests
 PHYSIONET_BASE = "https://physionet.org"
 DATABASE_URL = f"{PHYSIONET_BASE}/about/database/"
 CHALLENGE_URL = f"{PHYSIONET_BASE}/about/challenge/moody-challenge"
+TOPIC_DISCOVERY_URLS = [
+    f"{PHYSIONET_BASE}/content/?topic=eeg",
+    f"{PHYSIONET_BASE}/content/?topic=electroencephalogram",
+    f"{PHYSIONET_BASE}/content/?topic=polysomnogram",
+    f"{PHYSIONET_BASE}/content/?topic=sleep+study",
+    f"{PHYSIONET_BASE}/content/?topic=sleep+staging",
+    f"{PHYSIONET_BASE}/content/?topic=seizure",
+]
 DEFAULT_VERSION = "1.0.0"
 PAGE_TIMEOUT = 60
 WGET_CUT_DIRS = "3"  # files/<slug>/<version>/...
@@ -81,6 +89,17 @@ CARDIAC_CONTEXT_RE = re.compile(
     r"\bECG\b|electrocardiogram|electrocardiography|cardiac|heart\s*beats?|arrhythm",
     re.IGNORECASE,
 )
+NON_RAW_EEG_PRIMARY_RE = re.compile(
+    r"calcium\s+imaging|wide[- ]field\s+calcium|instantaneous\s+heart\s+rate\s+and\s+accelerometry|"
+    r"accelerometry\s+dataset\s+with\s+EEG\s+sleep\s+stage\s+labels|step\s+count|actigraphy|"
+    r"multitaper\s+spectra|spectra\s+recorded|EEG\s+spectra",
+    re.IGNORECASE,
+)
+RAW_EEG_TITLE_RE = re.compile(
+    r"scalp\s+EEG|EEG\s+(database|signals?|dataset|recordings?)|"
+    r"electroencephalogram.*dataset|polysomno|PSG|Sleep-EDF|seizure",
+    re.IGNORECASE,
+)
 NEGATIVE_MODALITY_RE = re.compile(
     r"\bECG\b|electrocardiogram|electrocardiography",
     re.IGNORECASE,
@@ -113,6 +132,39 @@ KNOWN_EEG_DATASETS = {
             "dataset with EEG channels plus auxiliary physiological channels"
         ),
     },
+    "chbmit/1.0.0": {
+        "title": "CHB-MIT Scalp EEG Database",
+        "access": "open-access",
+        "eeg_evidence": "curated allowlist: pediatric scalp EEG seizure database",
+    },
+    "siena-scalp-eeg/1.0.0": {
+        "title": "Siena Scalp EEG Database",
+        "access": "open-access",
+        "eeg_evidence": "curated allowlist: adult scalp EEG seizure database in EDF format",
+    },
+}
+CURATED_EEG_SEED_DATASETS = {
+    # EEG topic/search hits. These still go through normal validation unless
+    # also present in KNOWN_EEG_DATASETS above.
+    "auditory-eeg/1.0.0",
+    "bidsleep-dataset/1.0.0",
+    "chbmit/1.0.0",
+    "eeg-eye-gaze-data/1.0.0",
+    "eeg-eye-gaze-for-fls-tasks/1.0.0",
+    "eeg-gaba-anesthesia/1.0.0",
+    "eeg-power-anesthesia/1.0.0",
+    "eegmat/1.0.0",
+    "eegmmidb/1.0.0",
+    "hmc-sleep-staging/1.1",
+    "ltrsvp/1.0.0",
+    "motion-artifact/1.0.0",
+    "nch-sleep/3.1.0",
+    "psg-ipa/1.0.0",
+    "shhpsgdb/1.0.0",
+    "siena-scalp-eeg/1.0.0",
+    "sleep-edf/1.0.0",
+    "sleep-edfx/1.0.0",
+    "ucddb/1.0.0",
 }
 
 
@@ -212,6 +264,14 @@ def known_eeg_info(spec: DatasetSpec, note: str = "") -> DatasetInfo | None:
 def known_eeg_specs() -> list[DatasetSpec]:
     specs = []
     for dataset_id in sorted(KNOWN_EEG_DATASETS):
+        slug, version = dataset_id.split("/", 1)
+        specs.append(DatasetSpec(slug=slug, version=version))
+    return specs
+
+
+def curated_seed_specs() -> list[DatasetSpec]:
+    specs = []
+    for dataset_id in sorted(CURATED_EEG_SEED_DATASETS):
         slug, version = dataset_id.split("/", 1)
         specs.append(DatasetSpec(slug=slug, version=version))
     return specs
@@ -545,6 +605,12 @@ def is_acceptable_eeg_evidence(snippet: str, source: str) -> bool:
     return bool(EEG_CONTEXT_RE.search(snippet))
 
 
+def looks_like_non_raw_eeg_primary(title: str, content_text: str) -> bool:
+    if not NON_RAW_EEG_PRIMARY_RE.search(f"{title} {content_text[:2000]}"):
+        return False
+    return not RAW_EEG_TITLE_RE.search(title)
+
+
 def resolve_dataset(
     spec: DatasetSpec,
     session: requests.Session,
@@ -577,6 +643,10 @@ def resolve_dataset(
     info.title = extract_title(content_html, spec.slug)
     info.access = parse_access(content_text)
     info.size_bytes = parse_size(content_text)
+
+    if looks_like_non_raw_eeg_primary(info.title, content_text):
+        info.reject_reason = "REJECT_NON_RAW_EEG_PRIMARY: page suggests EEG labels/adjunct signals but primary dataset is not raw EEG/PSG"
+        return info
 
     evidence = find_eeg_evidence(info.title, "title")
     if not evidence:
@@ -952,16 +1022,40 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Discovery source page (default: {DATABASE_URL}).",
     )
     parser.add_argument(
+        "--discover-primary",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Scan --discover-url as the primary discovery source (default: true).",
+    )
+    parser.add_argument(
         "--discover-challenges",
         action=argparse.BooleanOptionalAction,
         default=True,
         help=f"Also discover project links from the PhysioNet challenge list (default: true; {CHALLENGE_URL}).",
     )
     parser.add_argument(
+        "--discover-topics",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Also discover project links from EEG/sleep/seizure PhysioNet topic pages.",
+    )
+    parser.add_argument(
+        "--discover-topic-url",
+        action="append",
+        default=[],
+        help="Additional PhysioNet topic/search URL to scan for dataset links. Repeatable.",
+    )
+    parser.add_argument(
         "--include-known-eeg",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="In --discover mode, include curated known EEG PhysioNet datasets such as challenge-2018/1.0.0.",
+    )
+    parser.add_argument(
+        "--include-curated-seeds",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="In --discover mode, include curated EEG/PSG candidate specs that still require normal validation.",
     )
     parser.add_argument(
         "--discover-limit",
@@ -1078,9 +1172,13 @@ def main() -> int:
     try:
         specs = read_dataset_specs(args)
         if args.discover:
-            discovery_sources = [("primary", args.discover_url)]
+            discovery_sources = [("primary", args.discover_url)] if args.discover_primary else []
             if args.discover_challenges:
                 discovery_sources.append(("challenges", CHALLENGE_URL))
+            topic_urls = list(TOPIC_DISCOVERY_URLS) if args.discover_topics else []
+            topic_urls.extend(args.discover_topic_url or [])
+            for idx, topic_url in enumerate(topic_urls, 1):
+                discovery_sources.append((f"topic-{idx}", topic_url))
             discovery_errors: list[str] = []
             for source_name, source_url in discovery_sources:
                 try:
@@ -1101,6 +1199,9 @@ def main() -> int:
                     f"from {source_name} ({source_url}); added {added}",
                     file=sys.stderr,
                 )
+            if args.include_curated_seeds:
+                added = append_unique_specs(specs, curated_seed_specs())
+                print(f"[DISCOVER] added {added} curated EEG/PSG seed specs", file=sys.stderr)
             if args.include_known_eeg:
                 added = append_unique_specs(specs, known_eeg_specs())
                 print(f"[DISCOVER] added {added} curated known EEG dataset specs", file=sys.stderr)

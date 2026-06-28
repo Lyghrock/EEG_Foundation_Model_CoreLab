@@ -4,6 +4,9 @@ This repository currently handles OpenNeuro and PhysioNet download entrypoints.
 TUH is intentionally kept outside this Slurm launcher flow and should be pulled
 with the official TUH rsync command on the machine that has the external disk.
 
+For copy-pasteable H100 commands split by `weijun` and `share`, see
+`data/eeg_data_prepare_commands.md`.
+
 ## Environment
 
 Create the runtime once on the machine that launches downloads:
@@ -193,6 +196,12 @@ The PhysioNet downloader is strict by design: a dataset must show `EEG` or
 before it is allowed into the download queue. If evidence is absent, the dataset
 is rejected even when it is open-access.
 
+The downloader also rejects projects where EEG appears only as labels, adjunct
+scoring, or derived spectra while the primary data are not raw EEG/PSG signals
+for EEG-FM pretraining. Examples include calcium-imaging sleep-state projects,
+heart-rate/accelerometry datasets with EEG sleep-stage labels, and multitaper
+spectra datasets.
+
 Validate one dataset URL:
 
 ```bash
@@ -210,7 +219,8 @@ conda run -n eeg_fm python data/download_PhysioNet.py \
 ```
 
 Discover EEG-related PhysioNet datasets from the official database list, the
-PhysioNet challenge list, and curated known EEG entries:
+PhysioNet challenge list, EEG/sleep/seizure topic pages, curated seed
+candidates, and curated known EEG entries:
 
 ```bash
 conda run -n eeg_fm python data/download_PhysioNet.py \
@@ -261,7 +271,9 @@ cd "$REPO"
 "$PY" data/download_PhysioNet.py \
   --discover \
   --no-discover-challenges \
+  --no-discover-topics \
   --no-include-known-eeg \
+  --no-include-curated-seeds \
   --dry-run \
   --sort name \
   --resolve-workers 4 \
@@ -282,9 +294,11 @@ OUT=/tmp/physionet_eeg_challenges_only.txt
 cd "$REPO"
 "$PY" data/download_PhysioNet.py \
   --discover \
-  --discover-url https://physionet.org/about/challenge/moody-challenge \
-  --no-discover-challenges \
+  --no-discover-primary \
+  --discover-challenges \
+  --no-discover-topics \
   --no-include-known-eeg \
+  --no-include-curated-seeds \
   --dry-run \
   --sort name \
   --resolve-workers 4 \

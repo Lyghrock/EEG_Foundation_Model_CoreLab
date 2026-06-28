@@ -7,6 +7,7 @@ import argparse
 import csv
 import json
 import math
+import re
 import statistics
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -45,6 +46,10 @@ PAIR_SUFFIXES = {
 }
 ANNOTATION_SUFFIXES = {".tse", ".lbl", ".rec", ".vmrk", ".edf.seizures", ".ann", ".arousal"}
 TEXT_SUFFIXES = {".txt", ".md"}
+LOCAL_TEXT_PAIR_RE = re.compile(
+    r"seizure|seizures|report|reports|summary|annotation|annotations|events|readme",
+    re.IGNORECASE,
+)
 GLOBAL_METADATA_NAMES = {
     "dataset_description.json",
     "participants.tsv",
@@ -440,6 +445,10 @@ def analyze_pairing(raw_row: dict[str, Any], context: dict[str, Any]) -> dict[st
         for row in context["by_dir"].get(dir_name, []):
             name = Path(row["relative_path"]).name
             lower = name.lower()
+            if dir_name == str(raw_path.parent):
+                suffix = row.get("suffix") or suffix_key(row["relative_path"])
+                if suffix in TEXT_SUFFIXES and LOCAL_TEXT_PAIR_RE.search(lower):
+                    text_pairs.append(row["relative_path"])
             if (
                 lower in {"participants.tsv", "sessions.tsv", "dataset_description.json"}
                 or lower.endswith("_scans.tsv")
