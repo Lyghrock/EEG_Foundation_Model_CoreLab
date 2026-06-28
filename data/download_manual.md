@@ -275,57 +275,188 @@ other PhysioNet datasets. The expected H100 output location is:
 /mnt/ddn/shared/datasets/eeg/PhysioNet/challenge-2018/1.0.0
 ```
 
-Dry-run validation through Slurm:
+### H100 Cross-Account Workflow
+
+Run this block as `weijun`. It updates the repo under the shared tree, creates a
+copy-based venv that does not point into `/home/weijun`, prepares writable data
+directories, and grants the `share` account access. This is the only part that
+should touch git.
 
 ```bash
+set -euo pipefail
+
 BASE=/mnt/ddn/shared/datasets/eeg/eeg_fm
-mkdir -p /mnt/ddn/shared/datasets/eeg/logs/slurm \
-         /mnt/ddn/shared/datasets/eeg/logs/download \
-         /mnt/ddn/shared/datasets/eeg/PhysioNet
+DATA_ROOT=/mnt/ddn/shared/datasets/eeg
+REPO=$BASE/repo
+PY=$BASE/venv/bin/python
 
-cd $BASE/repo/data
+mkdir -p "$BASE" \
+         "$DATA_ROOT/PhysioNet" \
+         "$DATA_ROOT/logs/slurm" \
+         "$DATA_ROOT/logs/download" \
+         "$DATA_ROOT/statistical_reports"
 
-sbatch \
-  --chdir=$BASE/repo/data \
-  --output=/mnt/ddn/shared/datasets/eeg/logs/slurm/physionet2018-%j.out \
-  --error=/mnt/ddn/shared/datasets/eeg/logs/slurm/physionet2018-%j.err \
+if [ -d "$REPO/.git" ]; then
+  git -C "$REPO" checkout main
+  git -C "$REPO" pull --ff-only origin main
+else
+  git clone git@github.com:Lyghrock/EEG_Foundation_Model_CoreLab.git "$REPO"
+fi
+
+if [ ! -x "$PY" ] || [ -L "$BASE/venv/bin/python3" ]; then
+  rm -rf "$BASE/venv"
+  /home/weijun/miniconda3/envs/eeg_fm/bin/python -m venv --copies "$BASE/venv"
+fi
+
+"$PY" -m pip install --upgrade pip
+"$PY" -m pip install --no-cache-dir -r "$REPO/requirements.txt"
+
+chmod -R a+rX "$REPO" "$BASE/venv"
+chmod -R a+rwX "$DATA_ROOT/PhysioNet" "$DATA_ROOT/logs" "$DATA_ROOT/statistical_reports" || \
+  echo "[WARN] chmod skipped for some existing files not owned by weijun; share-side write checks below are authoritative"
+
+if command -v setfacl >/dev/null 2>&1; then
+  setfacl -R -m u:share:rX "$REPO" "$BASE/venv" || \
+    echo "[WARN] setfacl read access had partial failures"
+  setfacl -R -m u:share:rwX "$DATA_ROOT/PhysioNet" "$DATA_ROOT/logs" "$DATA_ROOT/statistical_reports" || \
+    echo "[WARN] setfacl write access had partial failures"
+  setfacl -R -d -m u:share:rwX "$DATA_ROOT/PhysioNet" "$DATA_ROOT/logs" "$DATA_ROOT/statistical_reports" || \
+    echo "[WARN] setfacl default write access had partial failures"
+fi
+
+test -r "$REPO/data/sbatch_download.sh"
+test -r "$REPO/data/download_PhysioNet.py"
+test -r "$REPO/data/download_lists/physionet_challenge2018.txt"
+test -x "$PY"
+test ! -L "$BASE/venv/bin/python3"
+bash -n "$REPO/data/sbatch_download.sh"
+bash -n "$REPO/data/statistical_analysis/run_physionet_challenge2018_analysis.sh"
+"$PY" -c "import requests, numpy, pandas, matplotlib, mne; print('weijun checks OK')"
+```
+
+Run this block as `share`. It never pulls git and never touches `/home/weijun`.
+It verifies paths, permissions, Python imports, PhysioNet dry-run resolution,
+and Slurm argument parsing before submitting the real download.
+
+```bash
+set -euo pipefail
+
+BASE=/mnt/ddn/shared/datasets/eeg/eeg_fm
+DATA_ROOT=/mnt/ddn/shared/datasets/eeg
+REPO=$BASE/repo
+PY=$BASE/venv/bin/python
+DATA_DIR=$REPO/data
+SLURM_LOG_DIR=$DATA_ROOT/logs/slurm
+DOWNLOAD_LOG_DIR=$DATA_ROOT/logs/download
+PHYSIONET_ROOT=$DATA_ROOT/PhysioNet
+LIST=$DATA_DIR/download_lists/physionet_challenge2018.txt
+
+cd "$DATA_DIR"
+
+test "$(pwd -P)" = "$(cd "$DATA_DIR" && pwd -P)"
+test -r sbatch_download.sh
+test -r download_PhysioNet.py
+test -r "$LIST"
+test -x "$PY"
+bash -n sbatch_download.sh
+bash -n "$REPO/data/statistical_analysis/run_physionet_challenge2018_analysis.sh"
+"$PY" -c "import requests, numpy, pandas, matplotlib, mne; print('share imports OK')"
+
+touch "$PHYSIONET_ROOT/.share_write_test" && rm -f "$PHYSIONET_ROOT/.share_write_test"
+touch "$DOWNLOAD_LOG_DIR/.share_write_test" && rm -f "$DOWNLOAD_LOG_DIR/.share_write_test"
+touch "$SLURM_LOG_DIR/.share_write_test" && rm -f "$SLURM_LOG_DIR/.share_write_test"
+touch "$DATA_ROOT/statistical_reports/.share_write_test" && rm -f "$DATA_ROOT/statistical_reports/.share_write_test"
+
+"$PY" download_PhysioNet.py \
+  --datasets-file "$LIST" \
+  --output-dir "$PHYSIONET_ROOT" \
+  --max-workers 1 \
+  --max-size-mb 0 \
+  --resolve-workers 1 \
+  --sort size \
+  --dry-run
+
+if sbatch --help 2>&1 | grep -q -- "--test-only"; then
+  sbatch --test-only \
+    --chdir="$DATA_DIR" \
+    --output="$SLURM_LOG_DIR/physionet2018-%j.out" \
+    --error="$SLURM_LOG_DIR/physionet2018-%j.err" \
+    sbatch_download.sh \
+    --data-source physionet \
+    --python-bin "$PY" \
+    --download-script-dir "$DATA_DIR" \
+    --output-dir "$PHYSIONET_ROOT" \
+    --log-dir "$DOWNLOAD_LOG_DIR" \
+    --max-workers 1 \
+    --max-size-mb 0 \
+    --dry-run \
+    --datasets-file "$LIST" \
+    --sort size
+fi
+
+DRY_JOB_RAW=$(sbatch --parsable \
+  --chdir="$DATA_DIR" \
+  --output="$SLURM_LOG_DIR/physionet2018-dryrun-%j.out" \
+  --error="$SLURM_LOG_DIR/physionet2018-dryrun-%j.err" \
   sbatch_download.sh \
   --data-source physionet \
-  --python-bin $BASE/venv/bin/python \
-  --download-script-dir $BASE/repo/data \
-  --output-dir /mnt/ddn/shared/datasets/eeg/PhysioNet \
-  --log-dir /mnt/ddn/shared/datasets/eeg/logs/download \
+  --python-bin "$PY" \
+  --download-script-dir "$DATA_DIR" \
+  --output-dir "$PHYSIONET_ROOT" \
+  --log-dir "$DOWNLOAD_LOG_DIR" \
   --max-workers 1 \
   --max-size-mb 0 \
   --dry-run \
-  --datasets-file $BASE/repo/data/download_lists/physionet_challenge2018.txt \
-  --sort size
+  --datasets-file "$LIST" \
+  --sort size)
+DRY_JOB=${DRY_JOB_RAW%%;*}
+
+echo "Submitted dry-run job: $DRY_JOB"
+echo "Check it with:"
+echo "  sacct -j $DRY_JOB --format=JobID,JobName,State,ExitCode,Elapsed,NodeList,Reason%80"
+echo "  tail -n 200 $SLURM_LOG_DIR/physionet2018-dryrun-$DRY_JOB.out"
+echo "  tail -n 200 $SLURM_LOG_DIR/physionet2018-dryrun-$DRY_JOB.err"
 ```
 
-Full download through Slurm:
+After the dry-run Slurm job succeeds, run this as `share` for the real
+download:
 
 ```bash
+set -euo pipefail
+
 BASE=/mnt/ddn/shared/datasets/eeg/eeg_fm
-mkdir -p /mnt/ddn/shared/datasets/eeg/logs/slurm \
-         /mnt/ddn/shared/datasets/eeg/logs/download \
-         /mnt/ddn/shared/datasets/eeg/PhysioNet
+DATA_ROOT=/mnt/ddn/shared/datasets/eeg
+REPO=$BASE/repo
+PY=$BASE/venv/bin/python
+DATA_DIR=$REPO/data
+SLURM_LOG_DIR=$DATA_ROOT/logs/slurm
+DOWNLOAD_LOG_DIR=$DATA_ROOT/logs/download
+PHYSIONET_ROOT=$DATA_ROOT/PhysioNet
+LIST=$DATA_DIR/download_lists/physionet_challenge2018.txt
 
-cd $BASE/repo/data
+cd "$DATA_DIR"
 
-sbatch \
-  --chdir=$BASE/repo/data \
-  --output=/mnt/ddn/shared/datasets/eeg/logs/slurm/physionet2018-%j.out \
-  --error=/mnt/ddn/shared/datasets/eeg/logs/slurm/physionet2018-%j.err \
+JOB_RAW=$(sbatch --parsable \
+  --chdir="$DATA_DIR" \
+  --output="$SLURM_LOG_DIR/physionet2018-%j.out" \
+  --error="$SLURM_LOG_DIR/physionet2018-%j.err" \
   sbatch_download.sh \
   --data-source physionet \
-  --python-bin $BASE/venv/bin/python \
-  --download-script-dir $BASE/repo/data \
-  --output-dir /mnt/ddn/shared/datasets/eeg/PhysioNet \
-  --log-dir /mnt/ddn/shared/datasets/eeg/logs/download \
+  --python-bin "$PY" \
+  --download-script-dir "$DATA_DIR" \
+  --output-dir "$PHYSIONET_ROOT" \
+  --log-dir "$DOWNLOAD_LOG_DIR" \
   --max-workers 1 \
   --max-size-mb 0 \
-  --datasets-file $BASE/repo/data/download_lists/physionet_challenge2018.txt \
-  --sort size
+  --datasets-file "$LIST" \
+  --sort size)
+JOB=${JOB_RAW%%;*}
+
+echo "Submitted download job: $JOB"
+echo "Monitor with:"
+echo "  squeue -j $JOB"
+echo "  tail -f $SLURM_LOG_DIR/physionet2018-$JOB.out"
+echo "  tail -f $DOWNLOAD_LOG_DIR/physionet_${JOB}.log"
 ```
 
 The downloader will create:
@@ -336,11 +467,12 @@ The downloader will create:
 
 after a successful run. Later runs skip the dataset when this marker exists.
 
-After download, run the dataset-specific statistical-analysis wrapper from the
-cloned repo:
+After download, run the dataset-specific statistical-analysis wrapper as
+`share` from the cloned repo:
 
 ```bash
-cd /mnt/ddn/shared/datasets/eeg/eeg_fm/repo
+BASE=/mnt/ddn/shared/datasets/eeg/eeg_fm
+cd $BASE/repo
 bash data/statistical_analysis/run_physionet_challenge2018_analysis.sh
 ```
 
