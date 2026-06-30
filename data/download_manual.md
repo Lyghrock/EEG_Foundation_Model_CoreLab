@@ -652,6 +652,9 @@ ENABLE_PREPROCESS=true sbatch data/sbatch_download.sh
   `<output>/<slug>/<version>/`.
 - Each PhysioNet dataset directory uses `.download.lock` to avoid two workers
   writing the same dataset at once.
+- If a PhysioNet job is cancelled, stale `.download.lock` files can block the
+  restart. Use `--lock-stale-min N` on the next run after cancelling the old job;
+  locked datasets now make the job exit nonzero instead of pretending success.
 - Full wget output is written to per-dataset logs under
   `<output-parent>/logs/physionet_datasets/`; the Slurm log keeps only
   attempt-level summaries unless `--verbose-wget` is passed.

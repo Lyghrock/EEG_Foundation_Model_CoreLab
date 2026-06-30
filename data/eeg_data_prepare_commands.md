@@ -277,6 +277,7 @@ JOB_RAW=$(sbatch --parsable \
   --wget-tries 20 \
   --wget-timeout 120 \
   --wget-waitretry 30 \
+  --lock-stale-min 720 \
   --sort size \
   --write-eeg-list "$DOWNLOAD_LOG_DIR/physionet_eeg_discovered.txt")
 JOB=${JOB_RAW%%;*}

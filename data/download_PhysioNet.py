@@ -26,12 +26,14 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import dataclasses
+import errno
 import getpass
 import html
 import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -776,17 +778,108 @@ def build_wget_config(
     return config
 
 
-def acquire_dataset_lock(final_dir: Path) -> Optional[Path]:
+def read_lock_metadata(lock_path: Path) -> dict[str, str]:
+    metadata: dict[str, str] = {}
+    try:
+        for line in lock_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            metadata[key.strip()] = value.strip()
+    except OSError:
+        pass
+    return metadata
+
+
+def pid_is_alive_on_current_host(pid_text: str) -> bool:
+    try:
+        pid = int(pid_text)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError as exc:
+        return exc.errno == errno.EPERM
+    return True
+
+
+def lock_age_seconds(lock_path: Path, metadata: dict[str, str]) -> Optional[float]:
+    locked_at: Optional[float] = None
+    try:
+        locked_at = float(metadata.get("time", ""))
+    except ValueError:
+        locked_at = None
+    if locked_at is None:
+        try:
+            locked_at = lock_path.stat().st_mtime
+        except OSError:
+            return None
+    return max(0.0, time.time() - locked_at)
+
+
+def acquire_dataset_lock(
+    final_dir: Path,
+    lock_stale_min: Optional[float],
+    printer: Printer,
+    dataset_id: str,
+) -> Optional[Path]:
     final_dir.mkdir(parents=True, exist_ok=True)
     lock_path = final_dir / ".download.lock"
-    try:
-        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    except FileExistsError:
-        return None
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write(f"pid={os.getpid()}\n")
-        f.write(f"time={time.time()}\n")
-    return lock_path
+    while True:
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            metadata = read_lock_metadata(lock_path)
+            age = lock_age_seconds(lock_path, metadata)
+            current_host = socket.gethostname()
+            lock_host = metadata.get("host", "")
+            same_host = lock_host in {current_host, socket.getfqdn(), ""}
+            same_host_alive = same_host and pid_is_alive_on_current_host(
+                metadata.get("pid", "")
+            )
+
+            if (
+                lock_stale_min is not None
+                and age is not None
+                and age >= lock_stale_min * 60
+                and not same_host_alive
+            ):
+                try:
+                    lock_path.unlink()
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    printer.log(
+                        f"[{dataset_id}] [WARN] stale lock could not be removed: "
+                        f"{lock_path} ({exc})"
+                    )
+                    return None
+                printer.log(
+                    f"[{dataset_id}] [WARN] removed stale lock: {lock_path} "
+                    f"(age={age / 60:.1f} min, host={lock_host or 'unknown'}, "
+                    f"pid={metadata.get('pid', 'unknown')})"
+                )
+                continue
+
+            detail = ""
+            if age is not None:
+                detail += f" age={age / 60:.1f} min"
+            if lock_host:
+                detail += f" host={lock_host}"
+            if metadata.get("pid"):
+                detail += f" pid={metadata['pid']}"
+            if same_host_alive:
+                detail += " pid_alive=true"
+            printer.log(f"[{dataset_id}] [SKIP] lock exists:{detail}")
+            return None
+
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(f"pid={os.getpid()}\n")
+            f.write(f"host={socket.gethostname()}\n")
+            f.write(f"time={time.time()}\n")
+        return lock_path
 
 
 def run_checksum(final_dir: Path, printer: Printer, dataset_id: str) -> bool:
@@ -874,6 +967,7 @@ def download_one(
     wget_timeout: int,
     wget_waitretry: int,
     verbose_wget: bool,
+    lock_stale_min: Optional[float],
     printer: Printer,
 ) -> tuple[str, str]:
     dataset_id = info.spec.id
@@ -886,9 +980,13 @@ def download_one(
         printer.log(f"[{dataset_id}] [SKIP] completion marker exists: {marker}")
         return dataset_id, "skipped"
 
-    lock_path = acquire_dataset_lock(final_dir)
+    lock_path = acquire_dataset_lock(
+        final_dir,
+        lock_stale_min=lock_stale_min,
+        printer=printer,
+        dataset_id=dataset_id,
+    )
     if lock_path is None:
-        printer.log(f"[{dataset_id}] [SKIP] lock exists; another process may be downloading")
         return dataset_id, "locked"
 
     try:
@@ -1084,6 +1182,7 @@ def run_downloads(
                     args.wget_timeout,
                     args.wget_waitretry,
                     args.verbose_wget,
+                    args.lock_stale_min,
                     printer,
                 )
                 for info in eligible
@@ -1100,7 +1199,10 @@ def run_downloads(
         print(f"  output_dir: {output_dir.resolve()}")
         print(f"  dataset_logs: {dataset_log_dir.resolve()}")
         print("=" * 70)
-        return 0 if status_counts.get("failed", 0) == 0 else 1
+        return 0 if (
+            status_counts.get("failed", 0) == 0
+            and status_counts.get("locked", 0) == 0
+        ) else 1
     finally:
         if wget_config is not None:
             try:
@@ -1253,6 +1355,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Mirror full wget output to stdout. Full output is always kept in per-dataset logs.",
     )
     parser.add_argument(
+        "--lock-stale-min",
+        type=float,
+        default=None,
+        help=(
+            "Remove a dataset .download.lock if it is older than this many minutes "
+            "and its PID is not alive on the current host. Default: keep locks."
+        ),
+    )
+    parser.add_argument(
         "--open-access-only",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -1343,6 +1454,9 @@ def main() -> int:
         return 1
     if args.wget_waitretry < 0:
         print("[ERROR] --wget-waitretry must be >= 0", file=sys.stderr)
+        return 1
+    if args.lock_stale_min is not None and args.lock_stale_min < 0:
+        print("[ERROR] --lock-stale-min must be >= 0", file=sys.stderr)
         return 1
 
     if args.preprocess and not args.quiet:
