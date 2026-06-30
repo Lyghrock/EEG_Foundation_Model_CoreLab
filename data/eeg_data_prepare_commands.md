@@ -105,11 +105,11 @@ REPO=$BASE/repo
 PY=$BASE/venv/bin/python
 
 mkdir -p "$BASE" \
-         "$DATA_ROOT/OpenNeuro" \
-         "$DATA_ROOT/PhysioNet" \
-         "$DATA_ROOT/logs/slurm" \
-         "$DATA_ROOT/logs/download" \
-         "$DATA_ROOT/statistical_reports"
+         "$BASE/OpenNeuro" \
+         "$BASE/PhysioNet" \
+         "$BASE/logs/slurm" \
+         "$BASE/logs/download" \
+         "$BASE/statistical_reports"
 
 if [ -d "$REPO/.git" ]; then
   git -C "$REPO" checkout main
@@ -127,13 +127,13 @@ fi
 "$PY" -m pip install --no-cache-dir -r "$REPO/requirements.txt"
 
 chmod -R a+rX "$REPO" "$BASE/venv"
-chmod -R a+rwX "$DATA_ROOT/OpenNeuro" "$DATA_ROOT/PhysioNet" "$DATA_ROOT/logs" "$DATA_ROOT/statistical_reports" || \
+chmod -R a+rwX "$BASE/OpenNeuro" "$BASE/PhysioNet" "$BASE/logs" "$BASE/statistical_reports" || \
   echo "[WARN] chmod had partial failures on files not owned by weijun"
 
 if command -v setfacl >/dev/null 2>&1; then
   setfacl -R -m u:share:rX "$REPO" "$BASE/venv" || true
-  setfacl -R -m u:share:rwX "$DATA_ROOT/OpenNeuro" "$DATA_ROOT/PhysioNet" "$DATA_ROOT/logs" "$DATA_ROOT/statistical_reports" || true
-  setfacl -R -d -m u:share:rwX "$DATA_ROOT/OpenNeuro" "$DATA_ROOT/PhysioNet" "$DATA_ROOT/logs" "$DATA_ROOT/statistical_reports" || true
+  setfacl -R -m u:share:rwX "$BASE/OpenNeuro" "$BASE/PhysioNet" "$BASE/logs" "$BASE/statistical_reports" || true
+  setfacl -R -d -m u:share:rwX "$BASE/OpenNeuro" "$BASE/PhysioNet" "$BASE/logs" "$BASE/statistical_reports" || true
 fi
 
 test -r "$REPO/data/sbatch_download.sh"
@@ -158,9 +158,9 @@ DATA_ROOT=/mnt/ddn/shared/datasets/eeg
 REPO=$BASE/repo
 PY=$BASE/venv/bin/python
 DATA_DIR=$REPO/data
-SLURM_LOG_DIR=$DATA_ROOT/logs/slurm
-DOWNLOAD_LOG_DIR=$DATA_ROOT/logs/download
-PHYSIONET_ROOT=$DATA_ROOT/PhysioNet
+SLURM_LOG_DIR=$BASE/logs/slurm
+DOWNLOAD_LOG_DIR=$BASE/logs/download
+PHYSIONET_ROOT=$BASE/PhysioNet
 
 cd "$DATA_DIR"
 
@@ -178,7 +178,7 @@ bash -n "$REPO/data/statistical_analysis/run_physionet_challenge2018_analysis.sh
 touch "$PHYSIONET_ROOT/.share_write_test" && rm -f "$PHYSIONET_ROOT/.share_write_test"
 touch "$DOWNLOAD_LOG_DIR/.share_write_test" && rm -f "$DOWNLOAD_LOG_DIR/.share_write_test"
 touch "$SLURM_LOG_DIR/.share_write_test" && rm -f "$SLURM_LOG_DIR/.share_write_test"
-touch "$DATA_ROOT/statistical_reports/.share_write_test" && rm -f "$DATA_ROOT/statistical_reports/.share_write_test"
+touch "$BASE/statistical_reports/.share_write_test" && rm -f "$BASE/statistical_reports/.share_write_test"
 ```
 
 ## 4. PhysioNet Downloads As `share`
@@ -208,9 +208,9 @@ DATA_ROOT=/mnt/ddn/shared/datasets/eeg
 REPO=$BASE/repo
 PY=$BASE/venv/bin/python
 DATA_DIR=$REPO/data
-SLURM_LOG_DIR=$DATA_ROOT/logs/slurm
-DOWNLOAD_LOG_DIR=$DATA_ROOT/logs/download
-PHYSIONET_ROOT=$DATA_ROOT/PhysioNet
+SLURM_LOG_DIR=$BASE/logs/slurm
+DOWNLOAD_LOG_DIR=$BASE/logs/download
+PHYSIONET_ROOT=$BASE/PhysioNet
 
 cd "$DATA_DIR"
 
@@ -224,9 +224,11 @@ JOB_RAW=$(sbatch --parsable \
   --download-script-dir "$DATA_DIR" \
   --output-dir "$PHYSIONET_ROOT" \
   --log-dir "$DOWNLOAD_LOG_DIR" \
-  --max-workers 2 \
+  --max-workers 16 \
   --max-size-mb 0 \
   --discover \
+  --resolve-workers 16 \
+  --open-access-only \
   --sort size \
   --write-eeg-list "$DOWNLOAD_LOG_DIR/physionet_eeg_discovered.txt")
 JOB=${JOB_RAW%%;*}
@@ -246,16 +248,17 @@ DATA_DIR=$REPO/data
 cd "$DATA_DIR"
 sbatch \
   --chdir="$DATA_DIR" \
-  --output="$DATA_ROOT/logs/slurm/siena-%j.out" \
-  --error="$DATA_ROOT/logs/slurm/siena-%j.err" \
+  --output="$BASE/logs/slurm/siena-%j.out" \
+  --error="$BASE/logs/slurm/siena-%j.err" \
   sbatch_download.sh \
   --data-source physionet \
   --python-bin "$PY" \
   --download-script-dir "$DATA_DIR" \
-  --output-dir "$DATA_ROOT/PhysioNet" \
-  --log-dir "$DATA_ROOT/logs/download" \
+  --output-dir "$BASE/PhysioNet" \
+  --log-dir "$BASE/logs/download" \
   --max-workers 1 \
   --max-size-mb 0 \
+  --open-access-only \
   --datasets-file "$DATA_DIR/download_lists/physionet_siena.txt" \
   --sort size
 ```

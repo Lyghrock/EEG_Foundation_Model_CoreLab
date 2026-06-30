@@ -370,10 +370,10 @@ REPO=$BASE/repo
 PY=$BASE/venv/bin/python
 
 mkdir -p "$BASE" \
-         "$DATA_ROOT/PhysioNet" \
-         "$DATA_ROOT/logs/slurm" \
-         "$DATA_ROOT/logs/download" \
-         "$DATA_ROOT/statistical_reports"
+         "$BASE/PhysioNet" \
+         "$BASE/logs/slurm" \
+         "$BASE/logs/download" \
+         "$BASE/statistical_reports"
 
 if [ -d "$REPO/.git" ]; then
   git -C "$REPO" checkout main
@@ -391,15 +391,15 @@ fi
 "$PY" -m pip install --no-cache-dir -r "$REPO/requirements.txt"
 
 chmod -R a+rX "$REPO" "$BASE/venv"
-chmod -R a+rwX "$DATA_ROOT/PhysioNet" "$DATA_ROOT/logs" "$DATA_ROOT/statistical_reports" || \
+chmod -R a+rwX "$BASE/PhysioNet" "$BASE/logs" "$BASE/statistical_reports" || \
   echo "[WARN] chmod skipped for some existing files not owned by weijun; share-side write checks below are authoritative"
 
 if command -v setfacl >/dev/null 2>&1; then
   setfacl -R -m u:share:rX "$REPO" "$BASE/venv" || \
     echo "[WARN] setfacl read access had partial failures"
-  setfacl -R -m u:share:rwX "$DATA_ROOT/PhysioNet" "$DATA_ROOT/logs" "$DATA_ROOT/statistical_reports" || \
+  setfacl -R -m u:share:rwX "$BASE/PhysioNet" "$BASE/logs" "$BASE/statistical_reports" || \
     echo "[WARN] setfacl write access had partial failures"
-  setfacl -R -d -m u:share:rwX "$DATA_ROOT/PhysioNet" "$DATA_ROOT/logs" "$DATA_ROOT/statistical_reports" || \
+  setfacl -R -d -m u:share:rwX "$BASE/PhysioNet" "$BASE/logs" "$BASE/statistical_reports" || \
     echo "[WARN] setfacl default write access had partial failures"
 fi
 
@@ -425,9 +425,9 @@ DATA_ROOT=/mnt/ddn/shared/datasets/eeg
 REPO=$BASE/repo
 PY=$BASE/venv/bin/python
 DATA_DIR=$REPO/data
-SLURM_LOG_DIR=$DATA_ROOT/logs/slurm
-DOWNLOAD_LOG_DIR=$DATA_ROOT/logs/download
-PHYSIONET_ROOT=$DATA_ROOT/PhysioNet
+SLURM_LOG_DIR=$BASE/logs/slurm
+DOWNLOAD_LOG_DIR=$BASE/logs/download
+PHYSIONET_ROOT=$BASE/PhysioNet
 LIST=$DATA_DIR/download_lists/physionet_challenge2018.txt
 
 cd "$DATA_DIR"
@@ -444,7 +444,7 @@ bash -n "$REPO/data/statistical_analysis/run_physionet_challenge2018_analysis.sh
 touch "$PHYSIONET_ROOT/.share_write_test" && rm -f "$PHYSIONET_ROOT/.share_write_test"
 touch "$DOWNLOAD_LOG_DIR/.share_write_test" && rm -f "$DOWNLOAD_LOG_DIR/.share_write_test"
 touch "$SLURM_LOG_DIR/.share_write_test" && rm -f "$SLURM_LOG_DIR/.share_write_test"
-touch "$DATA_ROOT/statistical_reports/.share_write_test" && rm -f "$DATA_ROOT/statistical_reports/.share_write_test"
+touch "$BASE/statistical_reports/.share_write_test" && rm -f "$BASE/statistical_reports/.share_write_test"
 
 "$PY" download_PhysioNet.py \
   --datasets-file "$LIST" \
@@ -508,9 +508,9 @@ DATA_ROOT=/mnt/ddn/shared/datasets/eeg
 REPO=$BASE/repo
 PY=$BASE/venv/bin/python
 DATA_DIR=$REPO/data
-SLURM_LOG_DIR=$DATA_ROOT/logs/slurm
-DOWNLOAD_LOG_DIR=$DATA_ROOT/logs/download
-PHYSIONET_ROOT=$DATA_ROOT/PhysioNet
+SLURM_LOG_DIR=$BASE/logs/slurm
+DOWNLOAD_LOG_DIR=$BASE/logs/download
+PHYSIONET_ROOT=$BASE/PhysioNet
 LIST=$DATA_DIR/download_lists/physionet_challenge2018.txt
 
 cd "$DATA_DIR"
@@ -592,9 +592,11 @@ Slurm PhysioNet discovered batch download:
 ```bash
 sbatch data/sbatch_download.sh \
   --data-source physionet \
-  --max-workers 4 \
+  --max-workers 16 \
   --max-size-mb 0 \
   --discover \
+  --resolve-workers 16 \
+  --open-access-only \
   --sort size
 ```
 
@@ -631,5 +633,5 @@ ENABLE_PREPROCESS=true sbatch data/sbatch_download.sh
 - A successful PhysioNet download writes `.download_complete.json`; later runs
   skip that dataset.
 - `SHA256SUMS.txt` is checked automatically when present.
-- Avoid very high `MAX_WORKERS` for credentialed PhysioNet downloads; start with
-  2-4 workers and increase only if the server behaves well.
+- Open-access-only mode is the default. Credentialed, restricted, or unknown
+  access datasets are skipped unless `--no-open-access-only` is passed.

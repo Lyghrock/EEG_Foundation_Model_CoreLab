@@ -78,10 +78,10 @@ done
 
 case "${DATA_SOURCE}" in
     openneuro)
-        DEFAULT_OUTPUT_DIR="${SHARED_EEG_ROOT}/OpenNeuro"
+        DEFAULT_OUTPUT_DIR="${EEG_FM_ROOT}/OpenNeuro"
         ;;
     physionet)
-        DEFAULT_OUTPUT_DIR="${SHARED_EEG_ROOT}/PhysioNet"
+        DEFAULT_OUTPUT_DIR="${EEG_FM_ROOT}/PhysioNet"
         ;;
     custom)
         DEFAULT_OUTPUT_DIR="${EEG_FM_ROOT}/custom"

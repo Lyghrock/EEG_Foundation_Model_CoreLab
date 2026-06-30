@@ -113,6 +113,12 @@ ACCESS_RE = re.compile(
     r"\b(Open Access|Credentialed Access|Restricted Access)\b",
     re.IGNORECASE,
 )
+ACCESS_DENIED_RE = re.compile(
+    r"ERROR\s+40[13]|401\s+Unauthorized|403\s+Forbidden|"
+    r"authentication\s+failed|authorization\s+failed|login\s+incorrect|"
+    r"permission\s+denied|access\s+denied|please\s+log\s+in",
+    re.IGNORECASE,
+)
 TITLE_RE = re.compile(r"<h1[^>]*>(.*?)</h1>", re.IGNORECASE | re.DOTALL)
 HREF_RE = re.compile(r'href=["\']([^"\']+)["\']', re.IGNORECASE)
 CONTENT_VERSION_PATH_RE = re.compile(
@@ -861,12 +867,21 @@ def download_one(
             text=True,
             bufsize=1,
         )
+        access_denied_seen = False
         assert proc.stdout is not None
         for line in proc.stdout:
+            if ACCESS_DENIED_RE.search(line):
+                access_denied_seen = True
             if not quiet:
                 printer.log(f"[{dataset_id}] {line.rstrip()}")
         proc.wait()
         if proc.returncode != 0:
+            if access_denied_seen:
+                printer.log(
+                    f"[{dataset_id}] [SKIP] access denied by PhysioNet; "
+                    "continuing with other datasets"
+                )
+                return dataset_id, "access_denied"
             printer.log(f"[{dataset_id}] [ERROR] wget exit code {proc.returncode}")
             return dataset_id, "failed"
 
@@ -915,19 +930,42 @@ def run_downloads(
     tracker = SizeTracker(max_gb)
     printer = Printer(args.quiet)
     eligible: list[DatasetInfo] = []
+    pre_status_counts: dict[str, int] = {}
     for info in infos:
         if not info.is_eeg:
+            continue
+        if args.open_access_only and info.access != "open-access":
+            printer.log(
+                f"[{info.spec.id}] [SKIP] access={info.access}; "
+                "open-access-only mode"
+            )
+            pre_status_counts["access_skipped"] = (
+                pre_status_counts.get("access_skipped", 0) + 1
+            )
             continue
         if not tracker.reserve(info):
             printer.log(
                 f"[{info.spec.id}] [SKIP] exceeds max-size limit "
                 f"({info.size_str}, reserved {tracker.reserved_gb:.2f} GB)"
             )
+            pre_status_counts["size_skipped"] = (
+                pre_status_counts.get("size_skipped", 0) + 1
+            )
             continue
         eligible.append(info)
 
     if not eligible:
+        print()
+        print("=" * 70)
+        print("PhysioNet download summary")
+        if pre_status_counts:
+            for status, count in sorted(pre_status_counts.items()):
+                print(f"  {status}: {count}")
+            print(f"  output_dir: {output_dir.resolve()}")
+            print("=" * 70)
+            return 0
         print("[ERROR] no EEG-validated PhysioNet datasets to download", file=sys.stderr)
+        print("=" * 70)
         return 1
 
     if args.ask_password and args.max_workers > 1 and not password:
@@ -940,7 +978,7 @@ def run_downloads(
 
     wget_config = build_wget_config(username, password)
     try:
-        status_counts: dict[str, int] = {}
+        status_counts: dict[str, int] = dict(pre_status_counts)
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.max_workers) as pool:
             futures = [
                 pool.submit(
@@ -1078,6 +1116,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-size", type=float, default=None, metavar="GB")
     parser.add_argument("--max-size-mb", type=float, default=None, metavar="MB")
     parser.add_argument("--max-workers", type=int, default=2)
+    parser.add_argument(
+        "--open-access-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Download only datasets whose PhysioNet page says Open Access. "
+            "Credentialed/Restricted/unknown access datasets are skipped by default."
+        ),
+    )
     parser.add_argument(
         "--resolve-workers",
         type=int,
