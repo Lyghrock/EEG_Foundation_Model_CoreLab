@@ -224,12 +224,16 @@ JOB_RAW=$(sbatch --parsable \
   --download-script-dir "$DATA_DIR" \
   --output-dir "$PHYSIONET_ROOT" \
   --log-dir "$DOWNLOAD_LOG_DIR" \
-  --max-workers 16 \
+  --max-workers 4 \
   --max-size-mb 0 \
   --discover \
   --resolve-workers 16 \
   --open-access-only \
   --no-auth \
+  --dataset-retries 3 \
+  --wget-tries 20 \
+  --wget-timeout 120 \
+  --wget-waitretry 30 \
   --sort size \
   --write-eeg-list "$DOWNLOAD_LOG_DIR/physionet_eeg_discovered.txt")
 JOB=${JOB_RAW%%;*}

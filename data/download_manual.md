@@ -592,12 +592,16 @@ Slurm PhysioNet discovered batch download:
 ```bash
 sbatch data/sbatch_download.sh \
   --data-source physionet \
-  --max-workers 16 \
+  --max-workers 4 \
   --max-size-mb 0 \
   --discover \
   --resolve-workers 16 \
   --open-access-only \
   --no-auth \
+  --dataset-retries 3 \
+  --wget-tries 20 \
+  --wget-timeout 120 \
+  --wget-waitretry 30 \
   --sort size
 ```
 
@@ -631,6 +635,11 @@ ENABLE_PREPROCESS=true sbatch data/sbatch_download.sh
   `<output>/<slug>/<version>/`.
 - Each PhysioNet dataset directory uses `.download.lock` to avoid two workers
   writing the same dataset at once.
+- Full wget output is written to per-dataset logs under
+  `<output-parent>/logs/physionet_datasets/`; the Slurm log keeps only
+  attempt-level summaries unless `--verbose-wget` is passed.
+- Dataset downloads are retried with `--dataset-retries`; checksum failure
+  reruns wget to fill missing files before marking the dataset failed.
 - A successful PhysioNet download writes `.download_complete.json`; later runs
   skip that dataset.
 - `SHA256SUMS.txt` is checked automatically when present.

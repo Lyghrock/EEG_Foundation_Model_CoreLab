@@ -37,6 +37,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urljoin, urlparse
@@ -246,6 +247,10 @@ class Printer:
             return
         with self._lock:
             print(message, flush=True)
+
+
+def safe_dataset_label(dataset_id: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "__", dataset_id).strip("_") or "dataset"
 
 
 def known_eeg_info(spec: DatasetSpec, note: str = "") -> DatasetInfo | None:
@@ -804,6 +809,57 @@ def run_checksum(final_dir: Path, printer: Printer, dataset_id: str) -> bool:
     return True
 
 
+def run_wget_once(
+    cmd: list[str],
+    dataset_id: str,
+    dataset_log: Path,
+    quiet: bool,
+    verbose_wget: bool,
+    printer: Printer,
+) -> tuple[int, bool]:
+    """Run wget once, keeping full noisy output in a per-dataset log file."""
+    dataset_log.parent.mkdir(parents=True, exist_ok=True)
+    tail: deque[str] = deque(maxlen=30)
+    access_denied_seen = False
+
+    with dataset_log.open("a", encoding="utf-8", errors="replace") as log_f:
+        log_f.write("\n" + "=" * 80 + "\n")
+        log_f.write(f"dataset={dataset_id}\n")
+        log_f.write(f"started_at={time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n")
+        log_f.write("command=" + " ".join(cmd) + "\n")
+        log_f.write("=" * 80 + "\n")
+        log_f.flush()
+
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            log_f.write(line)
+            tail.append(line.rstrip())
+            if ACCESS_DENIED_RE.search(line):
+                access_denied_seen = True
+            if verbose_wget and not quiet:
+                printer.log(f"[{dataset_id}] {line.rstrip()}")
+        proc.wait()
+        log_f.write(f"\nreturncode={proc.returncode}\n")
+        log_f.write(f"finished_at={time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n")
+        log_f.flush()
+
+    if proc.returncode != 0 and not quiet:
+        printer.log(f"[{dataset_id}] wget tail from {dataset_log}:")
+        for line in tail:
+            printer.log(f"[{dataset_id}]   {line}")
+
+    return proc.returncode, access_denied_seen
+
+
 def download_one(
     info: DatasetInfo,
     output_dir: Path,
@@ -812,6 +868,12 @@ def download_one(
     ask_password: bool,
     checksum: bool,
     quiet: bool,
+    dataset_log_dir: Path,
+    dataset_retries: int,
+    wget_tries: int,
+    wget_timeout: int,
+    wget_waitretry: int,
+    verbose_wget: bool,
     printer: Printer,
 ) -> tuple[str, str]:
     dataset_id = info.spec.id
@@ -830,6 +892,7 @@ def download_one(
         return dataset_id, "locked"
 
     try:
+        dataset_log = dataset_log_dir / f"{safe_dataset_label(dataset_id)}.wget.log"
         cmd = [
             "wget",
             "-r",
@@ -843,6 +906,13 @@ def download_one(
             "index.html*",
             "-P",
             str(final_dir),
+            "--tries",
+            str(wget_tries),
+            "--retry-connrefused",
+            "--waitretry",
+            str(wget_waitretry),
+            "--timeout",
+            str(wget_timeout),
         ]
 
         if wget_config is not None:
@@ -850,43 +920,56 @@ def download_one(
         elif username and ask_password:
             cmd.extend(["--user", username, "--ask-password"])
 
-        if quiet:
+        if verbose_wget:
+            cmd.extend(["--progress=dot:giga"])
+        elif quiet:
             cmd.append("--quiet")
         else:
-            cmd.extend(["--progress=dot:giga"])
+            cmd.append("--no-verbose")
 
         cmd.append(info.files_url)
 
         printable_cmd = [c if c != str(wget_config) else "<wget-auth-config>" for c in cmd]
-        printer.log(f"[{dataset_id}] running: {' '.join(printable_cmd)}")
+        max_attempts = max(1, dataset_retries)
+        for attempt in range(1, max_attempts + 1):
+            printer.log(
+                f"[{dataset_id}] attempt {attempt}/{max_attempts}: "
+                f"{' '.join(printable_cmd)}"
+            )
+            printer.log(f"[{dataset_id}] wget log: {dataset_log}")
+            returncode, access_denied_seen = run_wget_once(
+                cmd,
+                dataset_id,
+                dataset_log,
+                quiet=quiet,
+                verbose_wget=verbose_wget,
+                printer=printer,
+            )
+            if returncode != 0:
+                if access_denied_seen:
+                    printer.log(
+                        f"[{dataset_id}] [SKIP] access denied by PhysioNet; "
+                        "continuing with other datasets"
+                    )
+                    return dataset_id, "access_denied"
+                if attempt < max_attempts:
+                    printer.log(
+                        f"[{dataset_id}] [WARN] wget exit code {returncode}; "
+                        "retrying dataset"
+                    )
+                    continue
+                printer.log(f"[{dataset_id}] [ERROR] wget exit code {returncode}")
+                return dataset_id, "failed"
 
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
-        access_denied_seen = False
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            if ACCESS_DENIED_RE.search(line):
-                access_denied_seen = True
-            if not quiet:
-                printer.log(f"[{dataset_id}] {line.rstrip()}")
-        proc.wait()
-        if proc.returncode != 0:
-            if access_denied_seen:
-                printer.log(
-                    f"[{dataset_id}] [SKIP] access denied by PhysioNet; "
-                    "continuing with other datasets"
-                )
-                return dataset_id, "access_denied"
-            printer.log(f"[{dataset_id}] [ERROR] wget exit code {proc.returncode}")
-            return dataset_id, "failed"
-
-        if checksum and not run_checksum(final_dir, printer, dataset_id):
-            return dataset_id, "failed"
+            if checksum and not run_checksum(final_dir, printer, dataset_id):
+                if attempt < max_attempts:
+                    printer.log(
+                        f"[{dataset_id}] [WARN] checksum failed; "
+                        "rerunning wget to fill missing files"
+                    )
+                    continue
+                return dataset_id, "failed"
+            break
 
         marker.write_text(
             json.dumps(
@@ -918,6 +1001,10 @@ def run_downloads(
 ) -> int:
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
+    dataset_log_dir = args.dataset_log_dir or (
+        output_dir.parent / "logs" / "physionet_datasets"
+    )
+    dataset_log_dir.mkdir(parents=True, exist_ok=True)
 
     max_gb = None
     if args.max_size_mb is not None:
@@ -990,6 +1077,12 @@ def run_downloads(
                     args.ask_password,
                     args.checksum,
                     args.quiet,
+                    dataset_log_dir,
+                    args.dataset_retries,
+                    args.wget_tries,
+                    args.wget_timeout,
+                    args.wget_waitretry,
+                    args.verbose_wget,
                     printer,
                 )
                 for info in eligible
@@ -1004,6 +1097,7 @@ def run_downloads(
         for status, count in sorted(status_counts.items()):
             print(f"  {status}: {count}")
         print(f"  output_dir: {output_dir.resolve()}")
+        print(f"  dataset_logs: {dataset_log_dir.resolve()}")
         print("=" * 70)
         return 0 if status_counts.get("failed", 0) == 0 else 1
     finally:
@@ -1117,6 +1211,47 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-size-mb", type=float, default=None, metavar="MB")
     parser.add_argument("--max-workers", type=int, default=2)
     parser.add_argument(
+        "--dataset-retries",
+        type=int,
+        default=3,
+        help=(
+            "Rerun wget/checksum for a dataset up to this many attempts. "
+            "Useful because PhysioNet recursive downloads can miss files during timeouts."
+        ),
+    )
+    parser.add_argument(
+        "--wget-tries",
+        type=int,
+        default=20,
+        help="Per-URL wget retry count passed to --tries.",
+    )
+    parser.add_argument(
+        "--wget-timeout",
+        type=int,
+        default=120,
+        help="Wget network timeout in seconds passed to --timeout.",
+    )
+    parser.add_argument(
+        "--wget-waitretry",
+        type=int,
+        default=30,
+        help="Maximum seconds wget waits between retries.",
+    )
+    parser.add_argument(
+        "--dataset-log-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory for per-dataset wget logs. Default: "
+            "<output-dir-parent>/logs/physionet_datasets."
+        ),
+    )
+    parser.add_argument(
+        "--verbose-wget",
+        action="store_true",
+        help="Mirror full wget output to stdout. Full output is always kept in per-dataset logs.",
+    )
+    parser.add_argument(
         "--open-access-only",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -1195,6 +1330,18 @@ def main() -> int:
         return 1
     if args.resolve_workers < 1:
         print("[ERROR] --resolve-workers must be >= 1", file=sys.stderr)
+        return 1
+    if args.dataset_retries < 1:
+        print("[ERROR] --dataset-retries must be >= 1", file=sys.stderr)
+        return 1
+    if args.wget_tries < 1:
+        print("[ERROR] --wget-tries must be >= 1", file=sys.stderr)
+        return 1
+    if args.wget_timeout < 1:
+        print("[ERROR] --wget-timeout must be >= 1", file=sys.stderr)
+        return 1
+    if args.wget_waitretry < 0:
+        print("[ERROR] --wget-waitretry must be >= 0", file=sys.stderr)
         return 1
 
     if args.preprocess and not args.quiet:
