@@ -148,7 +148,7 @@ conda run -n eeg_fm python data/download_OpenNeuro.py \
 Default H100 storage through the Slurm launcher:
 
 ```text
-/mnt/ddn/shared/datasets/eeg/OpenNeuro
+/mnt/ddn/shared/datasets/eeg/eeg_fm/OpenNeuro
 ```
 
 Slurm dry-run:
@@ -162,30 +162,47 @@ sbatch data/sbatch_download.sh \
 OpenNeuro full download through Slurm:
 
 ```bash
-sbatch data/sbatch_download.sh \
-  --data-source openneuro \
-  --download-backend aws \
-  --max-workers 4 \
-  --max-size-mb 0 \
-  --sort size
-```
+BASE=/mnt/ddn/shared/datasets/eeg/eeg_fm
+DATA_DIR=$BASE/repo/data
+PY=$BASE/venv/bin/python
+AWS_CFG=$BASE/aws/openneuro_aws_config
 
-If OpenNeuro downloads are slow or unstable, keep the public S3 backend and
-reduce dataset-level workers:
-
-```bash
-sbatch data/sbatch_download.sh \
+cd "$DATA_DIR"
+sbatch \
+  --export=ALL,AWS_CONFIG_FILE="$AWS_CFG" \
+  --chdir="$DATA_DIR" \
+  --output="$BASE/logs/slurm/openneuro-%j.out" \
+  --error="$BASE/logs/slurm/openneuro-%j.err" \
+  sbatch_download.sh \
   --data-source openneuro \
+  --python-bin "$PY" \
+  --download-script-dir "$DATA_DIR" \
+  --output-dir "$BASE/OpenNeuro" \
+  --log-dir "$BASE/logs/download" \
   --download-backend aws \
   --max-workers 2 \
   --max-size-mb 0 \
-  --sort size
+  --sort size \
+  --heartbeat-sec 60 \
+  --stall-timeout-min 180
+```
+
+If OpenNeuro downloads are slow or unstable, keep the public S3 backend and
+reduce dataset-level workers. To inspect awscli itself, add one of these
+diagnostic flags to the command above:
+
+```bash
+--aws-show-progress
+--aws-debug
 ```
 
 `--download-backend aws` uses OpenNeuro's public S3 bucket through `awscli`.
 AWS CLI also has internal multipart/concurrent transfers, so use
-`--max-workers 4` as the normal setting and reduce to `2` if the filesystem or
-network becomes saturated. `--sort size` downloads larger datasets first.
+`--max-workers 2` as the normal setting for very large datasets, then increase
+only if the filesystem and network stay healthy. `--sort size` downloads larger
+datasets first. `--heartbeat-sec` prints actual local byte growth, not only
+completed AWS files. `--stall-timeout-min` terminates a single stuck backend
+process after no local byte growth; rerunning resumes the same dataset.
 Interrupted dataset directories are resumed on the next run; only directories
 with `.download_complete.json` are skipped.
 

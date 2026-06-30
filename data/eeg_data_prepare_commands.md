@@ -181,7 +181,50 @@ touch "$SLURM_LOG_DIR/.share_write_test" && rm -f "$SLURM_LOG_DIR/.share_write_t
 touch "$BASE/statistical_reports/.share_write_test" && rm -f "$BASE/statistical_reports/.share_write_test"
 ```
 
-## 4. PhysioNet Downloads As `share`
+## 4. OpenNeuro Download As `share`
+
+```bash
+set -euo pipefail
+
+BASE=/mnt/ddn/shared/datasets/eeg/eeg_fm
+REPO=$BASE/repo
+PY=$BASE/venv/bin/python
+DATA_DIR=$REPO/data
+AWS_CFG=$BASE/aws/openneuro_aws_config
+SLURM_LOG_DIR=$BASE/logs/slurm
+DOWNLOAD_LOG_DIR=$BASE/logs/download
+OPENNEURO_ROOT=$BASE/OpenNeuro
+
+cd "$DATA_DIR"
+
+JOB_RAW=$(sbatch --parsable \
+  --export=ALL,AWS_CONFIG_FILE="$AWS_CFG" \
+  --chdir="$DATA_DIR" \
+  --output="$SLURM_LOG_DIR/openneuro-%j.out" \
+  --error="$SLURM_LOG_DIR/openneuro-%j.err" \
+  sbatch_download.sh \
+  --data-source openneuro \
+  --python-bin "$PY" \
+  --download-script-dir "$DATA_DIR" \
+  --output-dir "$OPENNEURO_ROOT" \
+  --log-dir "$DOWNLOAD_LOG_DIR" \
+  --max-workers 2 \
+  --max-size-mb 0 \
+  --download-backend aws \
+  --sort size \
+  --heartbeat-sec 60 \
+  --stall-timeout-min 180)
+JOB=${JOB_RAW%%;*}
+
+echo "Submitted OpenNeuro job: $JOB"
+echo "Slurm log: $SLURM_LOG_DIR/openneuro-${JOB}.out"
+echo "Script log: $DOWNLOAD_LOG_DIR/openneuro_${JOB}.log"
+```
+
+For a short diagnostic run, append `--aws-show-progress`. For request-level
+awscli diagnostics, append `--aws-debug`; this is intentionally very verbose.
+
+## 5. PhysioNet Downloads As `share`
 
 Full discovery dry-run:
 
@@ -272,7 +315,7 @@ sbatch \
 Challenge 2018-only download uses
 `data/download_lists/physionet_challenge2018.txt` in the same command shape.
 
-## 5. Statistical Validation As `share`
+## 6. Statistical Validation As `share`
 
 Run after each dataset exists locally.
 

@@ -283,7 +283,13 @@ def _resolve_backend(download_backend: str) -> str:
     return download_backend
 
 
-def _download_command(ds_id: str, ds_path: Path, backend: str) -> list[str]:
+def _download_command(
+    ds_id: str,
+    ds_path: Path,
+    backend: str,
+    aws_show_progress: bool = False,
+    aws_debug: bool = False,
+) -> list[str]:
     if backend == "aws":
         aws_cmd = _aws_command()
         if not aws_cmd:
@@ -291,15 +297,14 @@ def _download_command(ds_id: str, ds_path: Path, backend: str) -> list[str]:
                 "AWS backend requested but awscli is not available. "
                 "Install requirements.txt or use --download-backend openneuro."
             )
-        return [
-            *aws_cmd,
-            "s3",
-            "sync",
-            "--no-sign-request",
-            "--no-progress",
-            f"s3://openneuro.org/{ds_id}",
-            str(ds_path),
-        ]
+        cmd = [*aws_cmd]
+        if aws_debug:
+            cmd.append("--debug")
+        cmd.extend(["s3", "sync", "--no-sign-request"])
+        if not aws_show_progress:
+            cmd.append("--no-progress")
+        cmd.extend([f"s3://openneuro.org/{ds_id}", str(ds_path)])
+        return cmd
 
     if backend == "openneuro":
         return [
@@ -342,6 +347,10 @@ def download_one(
     quiet: bool,
     download_backend: str,
     expected_size_bytes: int,
+    heartbeat_sec: int = 60,
+    stall_timeout_min: float = 0.0,
+    aws_show_progress: bool = False,
+    aws_debug: bool = False,
 ) -> bool:
     """下载单个数据集, 返回是否成功。"""
     ds_path = target_dir / ds_id
@@ -367,10 +376,15 @@ def download_one(
             print(f"  [BACKEND] {backend}")
         start = time.time()
         initial_size = _dir_size(ds_path)
+        heartbeat_sec = max(10, int(heartbeat_sec or 60))
+        stall_timeout_sec = max(0.0, float(stall_timeout_min or 0.0)) * 60
         expected_total = expected_size_bytes if expected_size_bytes > 0 else None
         pbar = None
         transferred_bytes = 0
         completed_files = 0
+        aws_output_lines = 0
+        last_observed_size = initial_size
+        last_growth_time = start
         if not quiet and backend == "aws":
             if expected_total:
                 print(
@@ -401,7 +415,13 @@ def download_one(
                 )
 
         proc = subprocess.Popen(
-            _download_command(ds_id, ds_path, backend),
+            _download_command(
+                ds_id,
+                ds_path,
+                backend,
+                aws_show_progress=aws_show_progress,
+                aws_debug=aws_debug,
+            ),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -414,6 +434,7 @@ def download_one(
             if ready:
                 line = proc.stdout.readline()
                 if line:
+                    aws_output_lines += 1
                     if backend == "aws":
                         target_file = _parse_aws_download_target(line)
                         if target_file is not None:
@@ -423,6 +444,8 @@ def download_one(
                             except OSError:
                                 size = 0
                             transferred_bytes += size
+                            if size > 0:
+                                last_growth_time = time.time()
                             if pbar is not None and size > 0:
                                 if expected_total:
                                     allowed = max(0, expected_total - pbar.n)
@@ -448,26 +471,66 @@ def download_one(
                 break
 
             now = time.time()
-            if not quiet and now - last_heartbeat >= 60:
+            if now - last_heartbeat >= heartbeat_sec:
                 elapsed_min = (now - start) / 60
-                current_size = initial_size + transferred_bytes
-                if expected_total:
-                    pct = min(100.0, current_size / expected_total * 100)
-                    progress = (
-                        f"{completed_files} files, {_format_bytes(current_size)} / "
-                        f"{_format_bytes(expected_total)} ({pct:.1f}%)"
+                try:
+                    actual_size = _dir_size(ds_path)
+                except OSError as exc:
+                    actual_size = last_observed_size
+                    if not quiet:
+                        print(f"  [WARN] {ds_id}: cannot scan local size: {exc}", flush=True)
+                growth = actual_size - last_observed_size
+                if growth > 0:
+                    last_observed_size = actual_size
+                    last_growth_time = now
+                    if pbar is not None and actual_size > pbar.n:
+                        pbar.update(actual_size - pbar.n)
+                session_delta = max(0, actual_size - initial_size)
+                no_growth_min = (now - last_growth_time) / 60
+
+                if not quiet:
+                    if expected_total:
+                        pct = min(100.0, actual_size / expected_total * 100)
+                        progress = (
+                            f"{completed_files} completed files, "
+                            f"local {_format_bytes(actual_size)} / "
+                            f"{_format_bytes(expected_total)} ({pct:.1f}%), "
+                            f"session +{_format_bytes(session_delta)}, "
+                            f"last +{_format_bytes(max(0, growth))}, "
+                            f"no-growth {no_growth_min:.1f} min, "
+                            f"aws-lines {aws_output_lines}"
+                        )
+                    else:
+                        progress = (
+                            f"{completed_files} completed files, "
+                            f"local {_format_bytes(actual_size)}, "
+                            f"session +{_format_bytes(session_delta)}, "
+                            f"last +{_format_bytes(max(0, growth))}, "
+                            f"no-growth {no_growth_min:.1f} min, "
+                            f"aws-lines {aws_output_lines}"
+                        )
+                    print(
+                        f"  [WAIT] {ds_id}: {backend} backend still running "
+                        f"({elapsed_min:.1f} min, {progress})",
+                        flush=True,
                     )
-                else:
-                    progress = (
-                        f"{completed_files} files, "
-                        f"{_format_bytes(transferred_bytes)} transferred"
-                    )
-                print(
-                    f"  [WAIT] {ds_id}: {backend} backend still running "
-                    f"({elapsed_min:.1f} min, {progress})",
-                    flush=True,
-                )
                 last_heartbeat = now
+
+                if stall_timeout_sec and now - last_growth_time >= stall_timeout_sec:
+                    print(
+                        f"  [STALL] {ds_id}: no local byte growth for "
+                        f"{stall_timeout_min:.1f} min; terminating backend so a rerun can resume",
+                        flush=True,
+                    )
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=30)
+                    if pbar is not None:
+                        pbar.close()
+                    return False
         proc.wait()
         if pbar is not None:
             if expected_total and pbar.n < expected_total and proc.returncode == 0:
@@ -513,6 +576,10 @@ def run_pipeline(
     max_size: Optional[float],
     max_workers: int,
     download_backend: str,
+    heartbeat_sec: int,
+    stall_timeout_min: float,
+    aws_show_progress: bool,
+    aws_debug: bool,
     preprocess: bool,
     preprocess_kwargs: Optional[dict],
     quiet: bool,
@@ -542,6 +609,10 @@ def run_pipeline(
             quiet=quiet,
             download_backend=download_backend,
             expected_size_bytes=ds.size_bytes,
+            heartbeat_sec=heartbeat_sec,
+            stall_timeout_min=stall_timeout_min,
+            aws_show_progress=aws_show_progress,
+            aws_debug=aws_debug,
         )
 
         # ← 预处理 (可选)
@@ -696,6 +767,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--download-backend", type=str, default="auto",
                    choices=["auto", "openneuro", "aws"],
                    help="下载后端: auto/aws/openneuro (默认 auto, 有 awscli 时走公开 S3)")
+    p.add_argument("--heartbeat-sec", type=int, default=60, metavar="SEC",
+                   help="backend heartbeat interval in seconds")
+    p.add_argument("--stall-timeout-min", type=float, default=0.0, metavar="MIN",
+                   help="terminate one backend process after this many minutes with no local byte growth; 0 disables")
+    p.add_argument("--aws-show-progress", action="store_true",
+                   help="let awscli print its native per-file progress instead of --no-progress")
+    p.add_argument("--aws-debug", action="store_true",
+                   help="pass --debug to awscli for verbose request-level diagnostics")
 
     # 预处理
     p.add_argument("--preprocess", action="store_true",
@@ -802,6 +881,13 @@ def main():
         print(f"  并行下载: {args.max_workers} 个 worker")
     print(f"  下载后端: {args.download_backend}"
           f" -> {_resolve_backend(args.download_backend)}")
+    print(f"  AWS heartbeat: every {max(10, args.heartbeat_sec)} sec")
+    if args.stall_timeout_min and args.stall_timeout_min > 0:
+        print(f"  AWS stall timeout: {args.stall_timeout_min:.1f} min without local byte growth")
+    if args.aws_show_progress:
+        print("  AWS native progress: enabled")
+    if args.aws_debug:
+        print("  AWS debug output: enabled")
     if args.preprocess:
         print(f"  预处理  : 已启用")
         print(f"    采样率: {args.target_fs} Hz"
@@ -827,6 +913,10 @@ def main():
         max_size=max_size,
         max_workers=args.max_workers,
         download_backend=args.download_backend,
+        heartbeat_sec=args.heartbeat_sec,
+        stall_timeout_min=args.stall_timeout_min,
+        aws_show_progress=args.aws_show_progress,
+        aws_debug=args.aws_debug,
         preprocess=args.preprocess,
         preprocess_kwargs=preprocess_kwargs if args.preprocess else None,
         quiet=args.quiet,
