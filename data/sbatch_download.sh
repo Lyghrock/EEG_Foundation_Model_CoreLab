@@ -24,7 +24,7 @@
 #SBATCH --partition=h100
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=32G
-#SBATCH --time=72:00:00
+#SBATCH --time=999:00:00
 #SBATCH --gres=gpu:1
 
 set -euo pipefail
