@@ -655,6 +655,8 @@ ENABLE_PREPROCESS=true sbatch data/sbatch_download.sh
 - Full wget output is written to per-dataset logs under
   `<output-parent>/logs/physionet_datasets/`; the Slurm log keeps only
   attempt-level summaries unless `--verbose-wget` is passed.
+- PhysioNet wget recursion uses `--level=inf`; the default wget recursion
+  depth is too shallow for datasets with deeply nested EDF files.
 - Dataset downloads are retried with `--dataset-retries`; checksum failure
   reruns wget to fill missing files before marking the dataset failed.
 - A successful PhysioNet download writes `.download_complete.json`; later runs

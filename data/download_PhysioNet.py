@@ -896,6 +896,7 @@ def download_one(
         cmd = [
             "wget",
             "-r",
+            "--level=inf",
             "-N",
             "-c",
             "-np",
