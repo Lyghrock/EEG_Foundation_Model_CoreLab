@@ -1151,6 +1151,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="PhysioNet username. Overrides PHYSIONET_USERNAME and config file.",
     )
     parser.add_argument(
+        "--no-auth",
+        action="store_true",
+        help=(
+            "Ignore config/env PhysioNet credentials and download anonymously. "
+            "Use this with open-access-only jobs."
+        ),
+    )
+    parser.add_argument(
         "--config-file",
         type=Path,
         default=Path(__file__).with_name("config_physionet.json"),
@@ -1196,22 +1204,27 @@ def main() -> int:
             file=sys.stderr,
         )
 
-    try:
-        config = load_auth_config(args.config_file)
-    except ValueError as exc:
-        print(f"[ERROR] {exc}", file=sys.stderr)
-        return 1
+    if args.no_auth:
+        config = {}
+        username = None
+        password = None
+    else:
+        try:
+            config = load_auth_config(args.config_file)
+        except ValueError as exc:
+            print(f"[ERROR] {exc}", file=sys.stderr)
+            return 1
 
-    username = (
-        args.username
-        or os.environ.get("PHYSIONET_USERNAME")
-        or config.get("username")
-    )
-    password = (
-        os.environ.get(args.password_env)
-        if args.password_env
-        else None
-    ) or config.get("password")
+        username = (
+            args.username
+            or os.environ.get("PHYSIONET_USERNAME")
+            or config.get("username")
+        )
+        password = (
+            os.environ.get(args.password_env)
+            if args.password_env
+            else None
+        ) or config.get("password")
     if args.ask_password and username and not password:
         password = getpass.getpass(f"PhysioNet password for {username}: ")
 

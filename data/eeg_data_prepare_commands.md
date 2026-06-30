@@ -229,6 +229,7 @@ JOB_RAW=$(sbatch --parsable \
   --discover \
   --resolve-workers 16 \
   --open-access-only \
+  --no-auth \
   --sort size \
   --write-eeg-list "$DOWNLOAD_LOG_DIR/physionet_eeg_discovered.txt")
 JOB=${JOB_RAW%%;*}
@@ -259,6 +260,7 @@ sbatch \
   --max-workers 1 \
   --max-size-mb 0 \
   --open-access-only \
+  --no-auth \
   --datasets-file "$DATA_DIR/download_lists/physionet_siena.txt" \
   --sort size
 ```

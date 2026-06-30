@@ -597,6 +597,7 @@ sbatch data/sbatch_download.sh \
   --discover \
   --resolve-workers 16 \
   --open-access-only \
+  --no-auth \
   --sort size
 ```
 
