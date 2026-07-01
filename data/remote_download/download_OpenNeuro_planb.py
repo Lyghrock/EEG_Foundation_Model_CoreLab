@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import importlib.util
 import json
 import os
 import random
@@ -29,11 +28,14 @@ import subprocess
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
+from urllib.request import Request, urlopen
+import xml.etree.ElementTree as ET
 
 
 GRAPHQL_URL = "https://openneuro.org/crn/graphql"
@@ -104,61 +106,42 @@ def run_cmd(
     )
 
 
-def module_available(name: str) -> bool:
-    return importlib.util.find_spec(name) is not None
-
-
 def ensure_dependencies(install_missing: bool) -> None:
-    missing_modules = [
-        pkg for pkg in ["requests", "awscli"] if not module_available(pkg)
-    ]
-    if missing_modules and install_missing:
-        print(f"[DEPS] installing missing Python packages: {', '.join(missing_modules)}")
-        cmd = [
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "--user",
-            "--upgrade",
-            *missing_modules,
-        ]
-        proc = subprocess.run(cmd, text=True)
-        if proc.returncode != 0:
-            raise SystemExit(
-                "[ERROR] dependency install failed. Create a venv first, then rerun:\n"
-                "  python3 -m venv .venv\n"
-                "  source .venv/bin/activate\n"
-                "  python -m pip install --upgrade pip requests awscli tqdm"
-            )
-
-    still_missing = [
-        pkg for pkg in ["requests", "awscli"] if not module_available(pkg)
-    ]
-    if still_missing:
+    if sys.version_info < (3, 10):
         raise SystemExit(
-            "[ERROR] missing dependencies: "
-            + ", ".join(still_missing)
-            + "\nInstall them with: python -m pip install --user requests awscli tqdm"
+            f"[ERROR] Python >= 3.10 is required, got {sys.version.split()[0]}"
         )
-
-    if not aws_command():
-        raise SystemExit("[ERROR] awscli is unavailable after dependency check")
+    backends = available_transfer_backends()
+    print(
+        f"[DEPS] Python {sys.version.split()[0]} OK; "
+        f"available transfer backends: {', '.join(backends)}"
+    )
+    if install_missing and "awscli" not in backends:
+        print(
+            "[DEPS] awscli is not currently visible to Python; "
+            "run_OpenNeuro_planb.sh will try to install it before launching this script."
+        )
 
 
 def aws_command() -> list[str] | None:
+    env_cmd = os.environ.get("AWS_CLI_BIN", "").strip()
+    if env_cmd:
+        return shlex.split(env_cmd)
     aws_bin = shutil.which("aws")
     if aws_bin:
         return [aws_bin]
     try:
-        run_cmd(
+        proc = run_cmd(
             [sys.executable, "-m", "awscli", "--version"],
-            check=True,
+            check=False,
             capture=True,
+            timeout=15,
         )
-        return [sys.executable, "-m", "awscli"]
     except Exception:
         return None
+    if proc.returncode == 0:
+        return [sys.executable, "-m", "awscli"]
+    return None
 
 
 def curl_command() -> list[str] | None:
@@ -166,33 +149,46 @@ def curl_command() -> list[str] | None:
     return [curl_bin] if curl_bin else None
 
 
-def aws_base() -> list[str]:
-    cmd = aws_command()
-    if not cmd:
-        raise RuntimeError("awscli not found")
-    return cmd
+def available_transfer_backends() -> list[str]:
+    backends = ["urllib"]
+    if aws_command():
+        backends.append("awscli")
+    if curl_command():
+        backends.append("curl")
+    return backends
 
 
-def aws_json(args: list[str], timeout: int | None = None) -> dict[str, Any]:
-    cmd = [*aws_base(), *args, "--no-sign-request", "--output", "json"]
-    proc = run_cmd(cmd, timeout=timeout)
-    return json.loads(proc.stdout or "{}")
+def http_request(
+    url: str,
+    *,
+    method: str = "GET",
+    data: bytes | None = None,
+    headers: dict[str, str] | None = None,
+    timeout: int = 300,
+) -> bytes:
+    request = Request(
+        url,
+        data=data,
+        headers=headers or {},
+        method=method,
+    )
+    with urlopen(request, timeout=timeout) as response:
+        return response.read()
 
 
 def query_graphql(query: str, retries: int = 5, timeout: int = 60) -> dict[str, Any]:
-    import requests
-
     last_error: Exception | None = None
     for attempt in range(1, retries + 1):
         try:
-            response = requests.post(
+            body = json.dumps({"query": query}).encode("utf-8")
+            raw = http_request(
                 GRAPHQL_URL,
-                json={"query": query},
+                method="POST",
+                data=body,
                 headers=GRAPHQL_HEADERS,
                 timeout=timeout,
             )
-            response.raise_for_status()
-            payload = response.json()
+            payload = json.loads(raw.decode("utf-8"))
             if payload.get("errors") and not payload.get("data"):
                 raise RuntimeError(payload["errors"][0])
             return payload
@@ -373,7 +369,7 @@ class StateDB:
         return self.conn.execute(
             """
             select * from batches
-            where status in ('planned', 'downloading', 'downloaded', 'upload_failed')
+            where status in ('planned', 'downloading', 'download_failed', 'downloaded', 'upload_failed')
             order by created_at
             limit 1
             """
@@ -438,7 +434,7 @@ class StateDB:
             from objects
             where status in ('pending', 'planned', 'failed')
               and (batch_id is null or status in ('pending', 'failed'))
-            order by dataset, key
+            order by dataset, size desc, key
             """
         ).fetchall()
         selected: list[S3Object] = []
@@ -464,6 +460,24 @@ class StateDB:
             if total >= target_bytes:
                 break
         return selected
+
+    def oversized_pending_objects(self, max_object_bytes: int) -> list[S3Object]:
+        rows = self.conn.execute(
+            """
+            select dataset, key, size, etag, last_modified
+            from objects
+            where status in ('pending', 'planned', 'failed')
+              and (batch_id is null or status in ('pending', 'failed'))
+              and size > ?
+            order by size desc, key
+            limit 20
+            """,
+            (max_object_bytes,),
+        ).fetchall()
+        return [
+            S3Object(row["dataset"], row["key"], int(row["size"]), row["etag"] or "", row["last_modified"] or "")
+            for row in rows
+        ]
 
     def set_batch_status(self, batch_id: str, status: str, upload_command: str | None = None) -> None:
         now = utc_now()
@@ -516,24 +530,22 @@ def list_dataset_objects(dataset_id: str) -> list[S3Object]:
     prefix = dataset_id.rstrip("/") + "/"
     token: str | None = None
     objects: list[S3Object] = []
-    print(f"[LIST] {dataset_id}: listing s3://{OPENNEURO_BUCKET}/{prefix}")
+    print(f"[LIST] {dataset_id}: listing https://s3.amazonaws.com/{OPENNEURO_BUCKET}/{prefix}")
     while True:
-        args = [
-            "s3api",
-            "list-objects-v2",
-            "--bucket",
-            OPENNEURO_BUCKET,
-            "--prefix",
-            prefix,
-            "--page-size",
-            "1000",
-        ]
+        params = {
+            "list-type": "2",
+            "prefix": prefix,
+            "max-keys": "1000",
+        }
         if token:
-            args.extend(["--continuation-token", token])
-        payload = aws_json(args, timeout=300)
-        for item in payload.get("Contents", []):
-            key = item["Key"]
-            size = int(item.get("Size") or 0)
+            params["continuation-token"] = token
+        url = f"https://s3.amazonaws.com/{OPENNEURO_BUCKET}?{urlencode(params)}"
+        raw = http_request(url, timeout=300)
+        root = ET.fromstring(raw)
+        for item in root.findall(".//{*}Contents"):
+            key = item.findtext("{*}Key") or ""
+            size_text = item.findtext("{*}Size") or "0"
+            size = int(size_text)
             if key.endswith("/") or size == 0:
                 continue
             objects.append(
@@ -541,13 +553,14 @@ def list_dataset_objects(dataset_id: str) -> list[S3Object]:
                     dataset=dataset_id,
                     key=key,
                     size=size,
-                    etag=str(item.get("ETag", "")).strip('"'),
-                    last_modified=str(item.get("LastModified", "")),
+                    etag=(item.findtext("{*}ETag") or "").strip('"'),
+                    last_modified=item.findtext("{*}LastModified") or "",
                 )
             )
-        if not payload.get("IsTruncated"):
+        is_truncated = (root.findtext(".//{*}IsTruncated") or "").lower() == "true"
+        if not is_truncated:
             break
-        token = payload.get("NextContinuationToken")
+        token = root.findtext(".//{*}NextContinuationToken")
         if not token:
             break
         if len(objects) % 10000 < 1000:
@@ -598,7 +611,102 @@ def append_file(src: Path, dst: Path) -> None:
             out_f.write(chunk)
 
 
-def download_object(obj: S3Object, batch_dir: Path, retries: int, chunk_mb: int) -> bool:
+def s3_object_url(key: str) -> str:
+    return f"https://s3.amazonaws.com/{OPENNEURO_BUCKET}/{quote(key, safe='/')}"
+
+
+def download_range_urllib(key: str, start: int, end: int, dest: Path, timeout: int = 600) -> None:
+    request = Request(
+        s3_object_url(key),
+        headers={
+            "Range": f"bytes={start}-{end}",
+            "User-Agent": "EEG-FM-openneuro-planb/0.1",
+        },
+    )
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with urlopen(request, timeout=timeout) as response, dest.open("wb") as out_f:
+        while True:
+            chunk = response.read(1024 * 1024)
+            if not chunk:
+                break
+            out_f.write(chunk)
+
+
+def download_range_awscli(key: str, start: int, end: int, dest: Path, timeout: int = 3600) -> None:
+    aws = aws_command()
+    if not aws:
+        raise RuntimeError("awscli backend requested but awscli is not available")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        *aws,
+        "s3api",
+        "get-object",
+        "--bucket",
+        OPENNEURO_BUCKET,
+        "--key",
+        key,
+        "--range",
+        f"bytes={start}-{end}",
+        str(dest),
+        "--no-sign-request",
+        "--region",
+        "us-east-1",
+    ]
+    proc = run_cmd(cmd, check=False, capture=True, timeout=timeout)
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        raise RuntimeError(f"awscli failed exit={proc.returncode}: {detail[:800]}")
+
+
+def download_range_curl(key: str, start: int, end: int, dest: Path, timeout: int = 3600) -> None:
+    curl = curl_command()
+    if not curl:
+        raise RuntimeError("curl backend requested but curl is not available")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        *curl,
+        "-L",
+        "--fail",
+        "--retry",
+        "3",
+        "--retry-delay",
+        "2",
+        "--range",
+        f"{start}-{end}",
+        "-o",
+        str(dest),
+        s3_object_url(key),
+    ]
+    proc = run_cmd(cmd, check=False, capture=True, timeout=timeout)
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        raise RuntimeError(f"curl failed exit={proc.returncode}: {detail[:800]}")
+
+
+def download_range_backend(
+    backend: str,
+    key: str,
+    start: int,
+    end: int,
+    dest: Path,
+) -> None:
+    if backend == "urllib":
+        download_range_urllib(key, start, end, dest)
+    elif backend == "awscli":
+        download_range_awscli(key, start, end, dest)
+    elif backend == "curl":
+        download_range_curl(key, start, end, dest)
+    else:
+        raise ValueError(f"unknown transfer backend: {backend}")
+
+
+def download_object(
+    obj: S3Object,
+    batch_dir: Path,
+    retries: int,
+    chunk_mb: int,
+    transfer_backend: str,
+) -> bool:
     dest = local_path_for_key(batch_dir, obj.key)
     ok, reason = object_verified(dest, obj)
     if ok:
@@ -613,7 +721,7 @@ def download_object(obj: S3Object, batch_dir: Path, retries: int, chunk_mb: int)
     for attempt in range(1, retries + 1):
         print(
             f"[GET] {obj.key} -> {dest} ({human_bytes(obj.size)}), "
-            f"attempt {attempt}/{retries}"
+            f"backend={transfer_backend}, attempt {attempt}/{retries}"
         )
         start = time.time()
         chunk_bytes = max(1, int(chunk_mb)) * 1024**2
@@ -624,21 +732,10 @@ def download_object(obj: S3Object, batch_dir: Path, retries: int, chunk_mb: int)
             end = min(obj.size - 1, offset + chunk_bytes - 1)
             part = tmp.with_name(tmp.name + f".range_{offset}_{end}")
             part.unlink(missing_ok=True)
-            cmd = [
-                *aws_base(),
-                "s3api",
-                "get-object",
-                "--bucket",
-                OPENNEURO_BUCKET,
-                "--key",
-                obj.key,
-                "--range",
-                f"bytes={offset}-{end}",
-                str(part),
-                "--no-sign-request",
-            ]
-            proc = subprocess.run(cmd, text=True, stdout=subprocess.DEVNULL)
-            if proc.returncode != 0:
+            try:
+                download_range_backend(transfer_backend, obj.key, offset, end, part)
+            except Exception as exc:
+                print(f"[WARN] {obj.key}: range {offset}-{end} failed: {exc}")
                 part.unlink(missing_ok=True)
                 break
             expected = end - offset + 1
@@ -791,11 +888,101 @@ def scan_batch_quality(batch: sqlite3.Row, objects: list[S3Object], sample_n: in
     return report_path
 
 
+def timed_backend_range_download(
+    label: str,
+    backend: str,
+    key: str,
+    output_path: Path,
+    expected_bytes: int,
+) -> float:
+    if output_path.exists():
+        output_path.unlink()
+    print(f"[SPEED] {label}: {s3_object_url(key)} range=0-{expected_bytes - 1}")
+    start = time.time()
+    try:
+        download_range_backend(backend, key, 0, expected_bytes - 1, output_path)
+    except Exception as exc:
+        print(f"[SPEED] {label}: failed: {exc}")
+        output_path.unlink(missing_ok=True)
+        return 0.0
+    elapsed = max(0.001, time.time() - start)
+    got = output_path.stat().st_size if output_path.exists() else 0
+    mbps = got / elapsed / 1024**2
+    print(f"[SPEED] {label}: {human_bytes(got)} in {elapsed:.1f}s = {mbps:.2f} MiB/s")
+    if expected_bytes and got < expected_bytes * 0.95:
+        print(f"[WARN] {label}: expected about {human_bytes(expected_bytes)}, got {human_bytes(got)}")
+    output_path.unlink(missing_ok=True)
+    return mbps
+
+
+def benchmark_transfer_backends(
+    obj: S3Object,
+    sample_mb: int,
+    tmp_dir: Path,
+    candidates: list[str] | None = None,
+) -> dict[str, float]:
+    available = available_transfer_backends()
+    selected = candidates or available
+    selected = [backend for backend in selected if backend in available]
+    if not selected:
+        selected = ["urllib"]
+    sample_bytes = max(1, int(sample_mb)) * 1024**2
+    expected = min(sample_bytes, obj.size)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    results: dict[str, float] = {}
+    for backend in selected:
+        out = tmp_dir / f"openneuro_{backend}_range_test.bin"
+        results[backend] = timed_backend_range_download(
+            backend,
+            backend,
+            obj.key,
+            out,
+            expected,
+        )
+    return results
+
+
+def resolve_transfer_backend(
+    requested: str,
+    objects: list[S3Object],
+    probe_mb: int,
+    tmp_dir: Path,
+) -> str:
+    available = available_transfer_backends()
+    if requested != "auto":
+        if requested not in available:
+            raise SystemExit(
+                f"[ERROR] transfer backend {requested!r} is not available; "
+                f"available: {', '.join(available)}"
+            )
+        print(f"[BACKEND] using requested transfer backend: {requested}")
+        return requested
+    if not objects:
+        return "urllib"
+    probe_min = max(1, int(probe_mb)) * 1024**2
+    probe_obj = next((obj for obj in objects if obj.size >= probe_min), objects[0])
+    print(
+        f"[BACKEND] auto-probing transfer backends on {probe_obj.key} "
+        f"with sample={probe_mb} MiB"
+    )
+    results = benchmark_transfer_backends(probe_obj, probe_mb, tmp_dir, candidates=available)
+    nonzero = {name: value for name, value in results.items() if value > 0}
+    if not nonzero:
+        print("[BACKEND] all probes failed; falling back to urllib")
+        return "urllib"
+    best = max(nonzero, key=nonzero.get)
+    summary = ", ".join(f"{k}={v:.2f} MiB/s" for k, v in sorted(nonzero.items()))
+    print(f"[BACKEND] selected {best}; measured {summary}")
+    return best
+
+
 def download_batch(
     db: StateDB,
     batch: sqlite3.Row,
     retries: int,
     object_chunk_mb: int,
+    transfer_backend: str,
+    max_workers: int,
 ) -> bool:
     batch_id = batch["batch_id"]
     batch_dir = Path(batch["batch_dir"])
@@ -805,19 +992,55 @@ def download_batch(
     total = sum(o.size for o in objects)
     done = 0
     failures: list[str] = []
-    print(f"[BATCH] {batch_id}: {len(objects)} objects, {human_bytes(total)}")
-    for index, obj in enumerate(objects, 1):
-        ok = download_object(
-            obj,
-            batch_dir,
-            retries=retries,
-            chunk_mb=object_chunk_mb,
-        )
-        if not ok:
-            failures.append(obj.key)
-            continue
-        done += obj.size
-        print(f"[BATCH] {batch_id}: {index}/{len(objects)}, {human_bytes(done)} / {human_bytes(total)}")
+    workers = max(1, int(max_workers))
+    print(
+        f"[BATCH] {batch_id}: {len(objects)} objects, {human_bytes(total)}, "
+        f"backend={transfer_backend}, workers={workers}"
+    )
+    if workers == 1:
+        for index, obj in enumerate(objects, 1):
+            ok = download_object(
+                obj,
+                batch_dir,
+                retries=retries,
+                chunk_mb=object_chunk_mb,
+                transfer_backend=transfer_backend,
+            )
+            if not ok:
+                failures.append(obj.key)
+                continue
+            done += obj.size
+            print(f"[BATCH] {batch_id}: {index}/{len(objects)}, {human_bytes(done)} / {human_bytes(total)}")
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            future_to_obj = {
+                pool.submit(
+                    download_object,
+                    obj,
+                    batch_dir,
+                    retries,
+                    object_chunk_mb,
+                    transfer_backend,
+                ): obj
+                for obj in objects
+            }
+            completed = 0
+            for future in as_completed(future_to_obj):
+                obj = future_to_obj[future]
+                completed += 1
+                try:
+                    ok = bool(future.result())
+                except Exception as exc:
+                    print(f"[ERROR] {obj.key}: worker crashed: {exc}")
+                    ok = False
+                if not ok:
+                    failures.append(obj.key)
+                    continue
+                done += obj.size
+                print(
+                    f"[BATCH] {batch_id}: {completed}/{len(objects)}, "
+                    f"{human_bytes(done)} / {human_bytes(total)}"
+                )
     if failures:
         print(f"[BATCH] {batch_id}: failed {len(failures)} objects")
         db.set_batch_status(batch_id, "download_failed")
@@ -894,11 +1117,20 @@ def command_download(args: argparse.Namespace) -> int:
 
     build_manifest(db, datasets, refresh=args.refresh_manifest)
     if args.dry_run:
+        max_object_bytes = gb_to_bytes(args.local_budget_gb - args.min_free_gb)
         pending = db.next_objects(
             gb_to_bytes(args.batch_target_gb),
-            max_object_bytes=gb_to_bytes(args.local_budget_gb - args.min_free_gb),
+            max_object_bytes=max_object_bytes,
         )
         print(f"[DRY-RUN] next batch: {len(pending)} objects, {human_bytes(sum(o.size for o in pending))}")
+        oversized = db.oversized_pending_objects(max_object_bytes)
+        if oversized:
+            print(
+                f"[DRY-RUN] oversized pending objects beyond usable local budget "
+                f"({human_bytes(max_object_bytes)}):"
+            )
+            for obj in oversized[:10]:
+                print(f"  {human_bytes(obj.size):>10}  {obj.key}")
         print(f"[DRY-RUN] state counts: {db.object_counts()}")
         return 0
 
@@ -906,22 +1138,42 @@ def command_download(args: argparse.Namespace) -> int:
     while True:
         active = db.active_batch()
         if active is None:
+            max_object_bytes = gb_to_bytes(args.local_budget_gb - args.min_free_gb)
             objects = db.next_objects(
                 gb_to_bytes(args.batch_target_gb),
-                max_object_bytes=gb_to_bytes(args.local_budget_gb - args.min_free_gb),
+                max_object_bytes=max_object_bytes,
             )
             if not objects:
+                oversized = db.oversized_pending_objects(max_object_bytes)
+                if oversized:
+                    print(
+                        "[ERROR] pending objects are larger than the local usable budget. "
+                        "PlanB does not upload partial single files; increase --local-budget-gb "
+                        "or handle these objects with a streaming uploader."
+                    )
+                    for obj in oversized[:10]:
+                        print(f"  {human_bytes(obj.size):>10}  {obj.key}")
+                    return 4
                 print("[DONE] no pending objects remain")
                 return 0
             active = db.create_batch(objects, args.output_dir, state_dir)
 
         status = active["status"]
         if status in {"planned", "downloading", "download_failed"}:
+            batch_objects = db.batch_objects(active["batch_id"])
+            transfer_backend = resolve_transfer_backend(
+                args.transfer_backend,
+                batch_objects,
+                args.backend_probe_mb,
+                state_dir / "backend_probe",
+            )
             ok = download_batch(
                 db,
                 active,
                 retries=args.retries,
                 object_chunk_mb=args.object_chunk_mb,
+                transfer_backend=transfer_backend,
+                max_workers=args.max_workers,
             )
             if not ok:
                 return 2
@@ -995,69 +1247,28 @@ def choose_speed_object(dataset_id: str, min_size_mb: int) -> S3Object:
     raise RuntimeError(f"no objects found for {dataset_id}")
 
 
-def timed_download(label: str, cmd: list[str], output_path: Path, expected_bytes: int) -> float:
-    if output_path.exists():
-        output_path.unlink()
-    print(f"[SPEED] {label}: {' '.join(shlex.quote(c) for c in cmd)}")
-    start = time.time()
-    proc = subprocess.run(cmd, text=True)
-    elapsed = max(0.001, time.time() - start)
-    if proc.returncode != 0:
-        print(f"[SPEED] {label}: failed exit={proc.returncode}")
-        return 0.0
-    got = output_path.stat().st_size if output_path.exists() else 0
-    mbps = got / elapsed / 1024**2
-    print(f"[SPEED] {label}: {human_bytes(got)} in {elapsed:.1f}s = {mbps:.2f} MiB/s")
-    if expected_bytes and got < expected_bytes * 0.95:
-        print(f"[WARN] {label}: expected about {human_bytes(expected_bytes)}, got {human_bytes(got)}")
-    output_path.unlink(missing_ok=True)
-    return mbps
-
-
 def command_speed_test(args: argparse.Namespace) -> int:
     ensure_dependencies(not args.no_install)
     obj = choose_speed_object(args.dataset, args.min_object_mb)
-    sample_bytes = args.sample_mb * 1024**2
+    sample_bytes = max(1, args.sample_mb) * 1024**2
     end_byte = max(0, min(sample_bytes, obj.size) - 1)
-    expected = end_byte + 1
     print(f"[SPEED] selected {obj.key} ({human_bytes(obj.size)}), range 0-{end_byte}")
     tmp_dir = args.tmp_dir or Path(tempfile.gettempdir())
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-
-    aws_out = tmp_dir / "openneuro_aws_range_test.bin"
-    aws_cmd = [
-        *aws_base(),
-        "s3api",
-        "get-object",
-        "--bucket",
-        OPENNEURO_BUCKET,
-        "--key",
-        obj.key,
-        "--range",
-        f"bytes=0-{end_byte}",
-        str(aws_out),
-        "--no-sign-request",
-    ]
-    aws_mib = timed_download("awscli-range", aws_cmd, aws_out, expected)
-
-    curl_mib = 0.0
-    curl = curl_command()
-    if curl:
-        curl_out = tmp_dir / "openneuro_curl_range_test.bin"
-        url = f"https://s3.amazonaws.com/{OPENNEURO_BUCKET}/{quote(obj.key)}"
-        curl_cmd = [*curl, "-L", "--range", f"0-{end_byte}", "-o", str(curl_out), url]
-        curl_mib = timed_download("curl-range", curl_cmd, curl_out, expected)
+    results = benchmark_transfer_backends(obj, args.sample_mb, tmp_dir)
+    nonzero = {name: value for name, value in results.items() if value > 0}
+    if nonzero:
+        best = max(nonzero, key=nonzero.get)
+        summary = ", ".join(f"{k}={v:.2f} MiB/s" for k, v in sorted(nonzero.items()))
+        print(f"[SPEED] fastest backend on this host: {best} ({summary})")
     else:
-        print("[SPEED] curl not found; skipping curl comparison")
+        print("[SPEED] no backend completed the speed test")
 
     print("[INTERPRET]")
     print("  Compare this output between H100 and the overseas WSL machine.")
-    print("  If both awscli and curl are slow only on H100, the H100/network path is the bottleneck.")
-    print("  If curl is fast but awscli is slow on the same host, tune or replace awscli usage.")
+    print("  If all backends are slow only on H100, the H100/network path is the bottleneck.")
+    print("  If awscli is much faster than urllib on the same host, use --transfer-backend awscli.")
+    print("  If urllib is faster or awscli is unavailable, keep --transfer-backend auto or urllib.")
     print("  If both are fast on H100, the current Slurm job bottleneck is likely concurrency/job config.")
-    if aws_mib and curl_mib:
-        ratio = curl_mib / aws_mib if aws_mib else 0
-        print(f"  curl/awscli speed ratio on this host: {ratio:.2f}x")
     return 0
 
 
@@ -1068,7 +1279,11 @@ def build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--state-dir", type=Path, default=DEFAULT_STATE_DIR)
     common.add_argument("--log-dir", type=Path, default=DEFAULT_LOG_DIR)
-    common.add_argument("--no-install", action="store_true", help="Do not auto-install missing Python deps")
+    common.add_argument(
+        "--no-install",
+        action="store_true",
+        help="Do not ask the wrapper to install optional tools; Python itself will not install packages.",
+    )
 
     dl = sub.add_parser("download", parents=[common])
     dl.add_argument("--output-dir", type=Path, required=True, help="Local batch staging root")
@@ -1087,6 +1302,24 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=512,
         help="Range-download chunk size for single-object resume.",
+    )
+    dl.add_argument(
+        "--transfer-backend",
+        choices=["auto", "awscli", "urllib", "curl"],
+        default="auto",
+        help="Transfer backend. auto benchmarks available backends and uses the fastest.",
+    )
+    dl.add_argument(
+        "--backend-probe-mb",
+        type=int,
+        default=64,
+        help="MiB downloaded from one object to choose the fastest backend when --transfer-backend=auto.",
+    )
+    dl.add_argument(
+        "--max-workers",
+        type=int,
+        default=4,
+        help="Parallel object downloads inside one batch. Each object is written by only one worker.",
     )
     dl.add_argument("--max-batches", type=int, default=1, help="0 means run until all pending objects finish")
     dl.add_argument(

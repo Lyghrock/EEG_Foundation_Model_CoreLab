@@ -3,25 +3,36 @@
 This folder is for the overseas Windows + WSL machine with about 300 GB local
 storage. It is independent from Slurm and from `data/sbatch_download.sh`.
 
+Use `run_OpenNeuro_planb.sh` as the single entry point. The wrapper checks
+Python, prevents two concurrent runs from using the same state directory, and
+tries to install `awscli` into a local runtime venv. If that optional install
+fails, the Python script still falls back to standard-library `urllib` and
+available `curl`.
+
+The downloader lists OpenNeuro datasets through GraphQL and S3 REST metadata.
+For actual file transfer it can use `awscli`, `urllib`, or `curl`; with
+`--transfer-backend auto` it benchmarks the available backends and uses the
+fastest one for the batch.
+
 ## 1. Speed Test
 
 Run the same command on H100 and on the overseas WSL machine:
 
 ```bash
-python3 data/remote_download/download_OpenNeuro_planb.py speed-test \
+bash data/remote_download/run_OpenNeuro_planb.sh speed-test \
   --dataset ds004024 \
-  --sample-mb 1024 \
-  --min-object-mb 2048
+  --sample-mb 256 \
+  --min-object-mb 512
 ```
 
 Interpretation:
 
-- If both `awscli-range` and `curl-range` are slow on H100 but fast on WSL, the
-  H100 network path is the bottleneck.
-- If `curl-range` is fast but `awscli-range` is slow on the same host, tune or
-  replace AWS CLI usage.
-- If both are fast on H100, the existing Slurm job settings are likely the
+- If all backends are slow on H100 but fast on WSL, the H100 network path is the
   bottleneck.
+- If one backend is much faster on the same host, use that backend explicitly or
+  keep `--transfer-backend auto`.
+- If all backends are fast on H100, the existing Slurm job settings are likely
+  the bottleneck.
 
 ## 2. Download With Automatic Cloud Upload
 
@@ -38,25 +49,29 @@ Example with `rclone`:
 ```bash
 mkdir -p ~/openneuro_planb_stage
 
-python3 data/remote_download/download_OpenNeuro_planb.py download \
-  --output-dir ~/openneuro_planb_stage \
-  --state-dir ./openneuro_planb_state \
-  --log-dir ./openneuro_planb_logs \
+OUTPUT_DIR=~/openneuro_planb_stage \
+STATE_DIR=./openneuro_planb_state \
+LOG_DIR=./openneuro_planb_logs \
+UPLOAD_COMMAND='rclone copy "{batch_dir}" remote:OpenNeuro_PlanB --progress' \
+bash data/remote_download/run_OpenNeuro_planb.sh download \
   --local-budget-gb 250 \
-  --batch-target-gb 50 \
+  --batch-target-gb 220 \
+  --min-free-gb 20 \
+  --max-workers 4 \
+  --transfer-backend auto \
+  --backend-probe-mb 256 \
   --object-chunk-mb 512 \
   --max-batches 0 \
   --sort size \
-  --upload-command 'rclone copy "{batch_dir}" remote:OpenNeuro_PlanB --progress' \
   --delete-after-upload
 ```
 
 For a first smoke test:
 
 ```bash
-python3 data/remote_download/download_OpenNeuro_planb.py download \
-  --output-dir ~/openneuro_planb_stage \
-  --state-dir ./openneuro_planb_state \
+OUTPUT_DIR=~/openneuro_planb_stage \
+STATE_DIR=./openneuro_planb_state \
+bash data/remote_download/run_OpenNeuro_planb.sh download \
   --batch-target-gb 5 \
   --max-batches 1 \
   --dataset ds000117 \
@@ -66,12 +81,14 @@ python3 data/remote_download/download_OpenNeuro_planb.py download \
 
 ## 3. Manual Upload Mode
 
-If no upload command is configured, the script stops after one downloaded batch:
+Continuous mode requires an upload command. To intentionally stage one local
+batch without uploading, disable continuous mode and cap the run to one batch:
 
 ```bash
-python3 data/remote_download/download_OpenNeuro_planb.py download \
-  --output-dir ~/openneuro_planb_stage \
-  --state-dir ./openneuro_planb_state \
+OUTPUT_DIR=~/openneuro_planb_stage \
+STATE_DIR=./openneuro_planb_state \
+PLANB_CONTINUOUS=false \
+bash data/remote_download/run_OpenNeuro_planb.sh download \
   --batch-target-gb 50 \
   --max-batches 1
 ```
