@@ -48,22 +48,22 @@ Before stopping, each batch also writes `_planb_manifests/quality_report_*.json`
 with file counts, total size, extension statistics, and sampled JSON/TSV/binary
 read checks.
 
-Default values are already set in `run_OpenNeuro_planb.sh`:
+Default values are already set in `run_OpenNeuro_planb.sh`. The script no
+longer runs any upload command by itself; every `download` invocation stages
+exactly one manually uploaded batch.
 
 ```text
 OUTPUT_DIR=./openneuro_planb_stage
 STATE_DIR=$HOME/openneuro_planb/state
 LOG_DIR=$HOME/openneuro_planb/logs
 PLANB_LOCAL_BUDGET_GB=280
-PLANB_BATCH_TARGET_GB=250
+PLANB_BATCH_TARGET_GB=200
 PLANB_MIN_FREE_GB=20
 PLANB_MAX_WORKERS=8
 PLANB_TRANSFER_BACKEND=auto
 PLANB_BACKEND_PROBE_MB=256
 PLANB_OBJECT_CHUNK_MB=512
 PLANB_RETRIES=5
-PLANB_MAX_BATCHES=1
-PLANB_CONTINUOUS=false
 PLANB_AUTO_MARK_PREVIOUS_UPLOADED=true
 ```
 

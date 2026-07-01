@@ -11,11 +11,8 @@ PLANB_INSTALL_AWSCLI="${PLANB_INSTALL_AWSCLI:-false}"
 OUTPUT_DIR="${OUTPUT_DIR:-$PWD/openneuro_planb_stage}"
 STATE_DIR="${STATE_DIR:-$PLANB_BASE_DIR/state}"
 LOG_DIR="${LOG_DIR:-$PLANB_BASE_DIR/logs}"
-UPLOAD_COMMAND="${UPLOAD_COMMAND:-}"
-PLANB_CONTINUOUS="${PLANB_CONTINUOUS:-false}"
-PLANB_MAX_BATCHES="${PLANB_MAX_BATCHES:-1}"
 PLANB_LOCAL_BUDGET_GB="${PLANB_LOCAL_BUDGET_GB:-280}"
-PLANB_BATCH_TARGET_GB="${PLANB_BATCH_TARGET_GB:-250}"
+PLANB_BATCH_TARGET_GB="${PLANB_BATCH_TARGET_GB:-200}"
 PLANB_MIN_FREE_GB="${PLANB_MIN_FREE_GB:-20}"
 PLANB_MAX_WORKERS="${PLANB_MAX_WORKERS:-8}"
 PLANB_TRANSFER_BACKEND="${PLANB_TRANSFER_BACKEND:-auto}"
@@ -174,9 +171,6 @@ if [[ "$SUBCOMMAND" == "download" ]]; then
   if ! has_arg "--retries" "$@"; then
     EXTRA_ARGS+=(--retries "$PLANB_RETRIES")
   fi
-  if ! has_arg "--max-batches" "$@"; then
-    EXTRA_ARGS+=(--max-batches "$PLANB_MAX_BATCHES")
-  fi
   if ! has_arg "--auto-mark-previous-uploaded" "$@" && ! has_arg "--no-auto-mark-previous-uploaded" "$@"; then
     if is_truthy "$PLANB_AUTO_MARK_PREVIOUS_UPLOADED"; then
       EXTRA_ARGS+=(--auto-mark-previous-uploaded)
@@ -184,19 +178,11 @@ if [[ "$SUBCOMMAND" == "download" ]]; then
       EXTRA_ARGS+=(--no-auto-mark-previous-uploaded)
     fi
   fi
-  if [[ -n "$UPLOAD_COMMAND" ]] && ! has_arg "--upload-command" "$@"; then
-    EXTRA_ARGS+=(--upload-command "$UPLOAD_COMMAND")
-  fi
-  if is_truthy "$PLANB_CONTINUOUS" && [[ -z "$UPLOAD_COMMAND" ]] && ! has_arg "--upload-command" "$@" && ! has_arg "--dry-run" "$@"; then
-    echo "[ERROR] PLANB_CONTINUOUS=true requires UPLOAD_COMMAND or --upload-command."
-    echo "        Set PLANB_CONTINUOUS=false for a one-batch local staging run."
-    exit 8
-  fi
 
   echo "[RUN] output_dir=$OUTPUT_DIR"
   echo "[RUN] state_dir=$STATE_DIR"
   echo "[RUN] log_dir=$LOG_DIR"
-  echo "[RUN] continuous=$PLANB_CONTINUOUS max_batches=${PLANB_MAX_BATCHES}"
+  echo "[RUN] mode=one-manual-upload-batch"
   echo "[RUN] backend=$PLANB_TRANSFER_BACKEND workers=$PLANB_MAX_WORKERS batch_target_gb=$PLANB_BATCH_TARGET_GB"
   echo "[RUN] auto_mark_previous_uploaded=$PLANB_AUTO_MARK_PREVIOUS_UPLOADED"
 

@@ -3,15 +3,15 @@
 OpenNeuro Plan B downloader for a small overseas WSL machine.
 
 This script is intentionally independent from the Slurm launcher. It is built
-for a machine with limited local storage: it lists OpenNeuro S3 objects, downloads
-one bounded batch at a time, optionally uploads that batch to cloud storage, marks
-uploaded objects in a local SQLite state DB, and deletes the local batch.
+for a machine with limited local storage: it lists OpenNeuro S3 objects,
+downloads one bounded batch at a time, and tracks manually uploaded batches in
+a local SQLite state DB.
 
 The local batch directory mirrors OpenNeuro paths:
   <batch_dir>/dsXXXXXX/path/in/dataset
 
-If the upload command copies the batch directory into a cloud folder, all batches
-can later be merged back into the final OpenNeuro root.
+Each downloaded batch can be manually uploaded elsewhere and later merged back
+into the final OpenNeuro root.
 """
 
 from __future__ import annotations
@@ -49,8 +49,8 @@ GRAPHQL_HEADERS = {
 OPENNEURO_BUCKET = "openneuro.org"
 DEFAULT_STATE_DIR = Path("openneuro_planb_state")
 DEFAULT_LOG_DIR = Path("openneuro_planb_logs")
-DEFAULT_LOCAL_BUDGET_GB = 250.0
-DEFAULT_BATCH_TARGET_GB = 50.0
+DEFAULT_LOCAL_BUDGET_GB = 280.0
+DEFAULT_BATCH_TARGET_GB = 200.0
 MIN_FREE_GB = 20.0
 
 
@@ -503,7 +503,7 @@ class StateDB:
             for row in rows
         ]
 
-    def set_batch_status(self, batch_id: str, status: str, upload_command: str | None = None) -> None:
+    def set_batch_status(self, batch_id: str, status: str, upload_note: str | None = None) -> None:
         now = utc_now()
         uploaded_at = now if status == "uploaded" else None
         self.conn.execute(
@@ -513,11 +513,11 @@ class StateDB:
                 upload_command=coalesce(?, upload_command)
             where batch_id=?
             """,
-            (status, now, uploaded_at, upload_command, batch_id),
+            (status, now, uploaded_at, upload_note, batch_id),
         )
         self.conn.commit()
 
-    def mark_batch_uploaded(self, batch_id: str, upload_command: str | None = None) -> None:
+    def mark_batch_uploaded(self, batch_id: str, upload_note: str | None = None) -> None:
         now = utc_now()
         self.conn.execute(
             """
@@ -533,7 +533,7 @@ class StateDB:
             set status='uploaded', uploaded_at=?, updated_at=?, upload_command=coalesce(?, upload_command)
             where batch_id=?
             """,
-            (now, now, upload_command, batch_id),
+            (now, now, upload_note, batch_id),
         )
         self.conn.commit()
 
@@ -1084,26 +1084,6 @@ def download_batch(
     return True
 
 
-def run_upload_command(command_template: str, batch: sqlite3.Row) -> bool:
-    batch_dir = Path(batch["batch_dir"]).resolve()
-    manifest = Path(batch["manifest_path"]).resolve()
-    mapping = {
-        "batch_dir": str(batch_dir),
-        "batch_id": batch["batch_id"],
-        "manifest": str(manifest),
-    }
-    command = command_template.format(**mapping)
-    print(f"[UPLOAD] {command}")
-    start = time.time()
-    proc = subprocess.run(command, shell=True, text=True)
-    elapsed = max(0.001, time.time() - start)
-    if proc.returncode != 0:
-        print(f"[UPLOAD] failed with exit code {proc.returncode}")
-        return False
-    print(f"[UPLOAD] done in {elapsed / 60:.1f} min")
-    return True
-
-
 def remove_batch_dir(batch: sqlite3.Row) -> None:
     batch_dir = Path(batch["batch_dir"])
     if batch_dir.exists():
@@ -1155,7 +1135,7 @@ def command_download(args: argparse.Namespace) -> int:
     log_dir.mkdir(parents=True, exist_ok=True)
     db = StateDB(state_dir / "openneuro_planb.sqlite3")
 
-    if args.auto_mark_previous_uploaded and not args.upload_command:
+    if args.auto_mark_previous_uploaded:
         finalize_previous_manual_batch(db, args.delete_after_upload)
 
     stage_has_space(args.output_dir, args.local_budget_gb, args.min_free_gb)
@@ -1186,76 +1166,78 @@ def command_download(args: argparse.Namespace) -> int:
         print(f"[DRY-RUN] state counts: {db.object_counts()}")
         return 0
 
-    batch_count = 0
-    while True:
-        active = db.active_batch()
-        if active is None:
-            max_object_bytes = gb_to_bytes(args.local_budget_gb - args.min_free_gb)
-            objects = db.next_objects(
-                gb_to_bytes(args.batch_target_gb),
-                max_object_bytes=max_object_bytes,
-            )
-            if not objects:
-                oversized = db.oversized_pending_objects(max_object_bytes)
-                if oversized:
-                    print(
-                        "[ERROR] pending objects are larger than the local usable budget. "
-                        "PlanB does not upload partial single files; increase --local-budget-gb "
-                        "or handle these objects with a streaming uploader."
-                    )
-                    for obj in oversized[:10]:
-                        print(f"  {human_bytes(obj.size):>10}  {obj.key}")
-                    return 4
-                print("[DONE] no pending objects remain")
-                return 0
-            active = db.create_batch(objects, args.output_dir, state_dir)
-
-        status = active["status"]
-        if status in {"planned", "downloading", "download_failed"}:
-            batch_objects = db.batch_objects(active["batch_id"])
-            transfer_backend = resolve_transfer_backend(
-                args.transfer_backend,
-                batch_objects,
-                args.backend_probe_mb,
-                state_dir / "backend_probe",
-            )
-            ok = download_batch(
-                db,
-                active,
-                retries=args.retries,
-                object_chunk_mb=args.object_chunk_mb,
-                transfer_backend=transfer_backend,
-                max_workers=args.max_workers,
-            )
-            if not ok:
-                return 2
-            active = db.conn.execute(
-                "select * from batches where batch_id=?", (active["batch_id"],)
-            ).fetchone()
-
-        if args.upload_command:
-            ok = run_upload_command(args.upload_command, active)
-            if not ok:
-                db.set_batch_status(active["batch_id"], "upload_failed", args.upload_command)
-                return 3
-            db.mark_batch_uploaded(active["batch_id"], args.upload_command)
-            if args.delete_after_upload:
-                remove_batch_dir(active)
-        else:
-            print(
-                "[PAUSE] batch downloaded but no --upload-command was provided. "
-                "Upload it manually, then run mark-uploaded."
-            )
-            print(f"  batch_id: {active['batch_id']}")
-            print(f"  batch_dir: {active['batch_dir']}")
-            print(f"  manifest:  {active['manifest_path']}")
+    active = db.active_batch()
+    if active is None:
+        max_object_bytes = gb_to_bytes(args.local_budget_gb - args.min_free_gb)
+        objects = db.next_objects(
+            gb_to_bytes(args.batch_target_gb),
+            max_object_bytes=max_object_bytes,
+        )
+        if not objects:
+            oversized = db.oversized_pending_objects(max_object_bytes)
+            if oversized:
+                print(
+                    "[ERROR] pending objects are larger than the local usable budget. "
+                    "PlanB does not upload partial single files; increase --local-budget-gb "
+                    "or handle these objects with a streaming uploader."
+                )
+                for obj in oversized[:10]:
+                    print(f"  {human_bytes(obj.size):>10}  {obj.key}")
+                return 4
+            print("[DONE] no pending objects remain")
             return 0
+        active = db.create_batch(objects, args.output_dir, state_dir)
 
-        batch_count += 1
-        print(f"[STATE] {db.object_counts()}")
-        if args.max_batches > 0 and batch_count >= args.max_batches:
-            print(f"[STOP] reached --max-batches {args.max_batches}")
-            return 0
+    status = active["status"]
+    if status in {"planned", "downloading", "download_failed"}:
+        batch_objects = db.batch_objects(active["batch_id"])
+        transfer_backend = resolve_transfer_backend(
+            args.transfer_backend,
+            batch_objects,
+            args.backend_probe_mb,
+            state_dir / "backend_probe",
+        )
+        ok = download_batch(
+            db,
+            active,
+            retries=args.retries,
+            object_chunk_mb=args.object_chunk_mb,
+            transfer_backend=transfer_backend,
+            max_workers=args.max_workers,
+        )
+        if not ok:
+            return 2
+        active = db.conn.execute(
+            "select * from batches where batch_id=?", (active["batch_id"],)
+        ).fetchone()
+    elif status == "downloaded":
+        print(
+            f"[PAUSE] previous batch {active['batch_id']} is already downloaded. "
+            "Upload it manually, then run download again to clean it and start the next batch."
+        )
+        print(f"  batch_id: {active['batch_id']}")
+        print(f"  batch_dir: {active['batch_dir']}")
+        print(f"  manifest:  {active['manifest_path']}")
+        return 0
+    elif status == "upload_failed":
+        print(
+            f"[PAUSE] previous batch {active['batch_id']} is in legacy upload_failed state. "
+            "Check that it was uploaded before marking or cleaning it."
+        )
+        print(f"  batch_id: {active['batch_id']}")
+        print(f"  batch_dir: {active['batch_dir']}")
+        print(f"  manifest:  {active['manifest_path']}")
+        return 0
+
+    print(
+        "[PAUSE] one batch downloaded. Upload this batch manually, "
+        "then run download again to clean it and start the next batch."
+    )
+    print(f"  batch_id: {active['batch_id']}")
+    print(f"  batch_dir: {active['batch_dir']}")
+    print(f"  manifest:  {active['manifest_path']}")
+    print(f"[STATE] {db.object_counts()}")
+    return 0
 
 
 def command_mark_uploaded(args: argparse.Namespace) -> int:
@@ -1373,25 +1355,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=4,
         help="Parallel object downloads inside one batch. Each object is written by only one worker.",
     )
-    dl.add_argument("--max-batches", type=int, default=1, help="0 means run until all pending objects finish")
     dl.add_argument(
         "--auto-mark-previous-uploaded",
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
             "Manual-upload mode convenience. When a previous batch is fully downloaded "
-            "and no --upload-command is configured, the next download run assumes the "
-            "operator has uploaded it, marks it uploaded, and removes its local batch dir "
-            "when --delete-after-upload is enabled."
-        ),
-    )
-    dl.add_argument(
-        "--upload-command",
-        default=None,
-        help=(
-            "Shell command template run after each batch. Placeholders: "
-            "{batch_dir}, {batch_id}, {manifest}. Example: "
-            "'rclone copy \"{batch_dir}\" remote:OpenNeuro_PlanB --progress'"
+            "the next download run assumes the operator has uploaded it, marks it "
+            "uploaded, and removes its local batch dir when --delete-after-upload "
+            "is enabled."
         ),
     )
     dl.add_argument("--delete-after-upload", action=argparse.BooleanOptionalAction, default=True)
