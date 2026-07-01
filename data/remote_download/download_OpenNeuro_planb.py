@@ -388,6 +388,27 @@ class StateDB:
             for row in rows
         ]
 
+    def next_batch_id(self) -> str:
+        rows = self.conn.execute("select batch_id from batches").fetchall()
+        max_index = 0
+        for row in rows:
+            batch_id = str(row["batch_id"])
+            if not batch_id.startswith("batch_"):
+                continue
+            suffix = batch_id.removeprefix("batch_")
+            if suffix.isdigit():
+                max_index = max(max_index, int(suffix))
+
+        while True:
+            max_index += 1
+            candidate = f"batch_{max_index:06d}"
+            exists = self.conn.execute(
+                "select 1 from batches where batch_id=?",
+                (candidate,),
+            ).fetchone()
+            if not exists:
+                return candidate
+
     def create_batch(
         self,
         objects: list[S3Object],
@@ -396,7 +417,7 @@ class StateDB:
     ) -> sqlite3.Row:
         if not objects:
             raise ValueError("cannot create empty batch")
-        batch_id = "batch_" + datetime.now().strftime("%Y%m%d_%H%M%S")
+        batch_id = self.next_batch_id()
         batch_dir = output_dir / batch_id
         manifest_path = state_dir / "manifests" / f"{batch_id}.jsonl"
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1090,6 +1111,21 @@ def remove_batch_dir(batch: sqlite3.Row) -> None:
         shutil.rmtree(batch_dir)
 
 
+def finalize_previous_manual_batch(db: StateDB, delete_after_upload: bool) -> None:
+    active = db.active_batch()
+    if active is None or active["status"] != "downloaded":
+        return
+
+    batch_id = active["batch_id"]
+    print(
+        f"[RESUME] previous batch {batch_id} is already downloaded; "
+        "assuming it was manually uploaded before this run"
+    )
+    db.mark_batch_uploaded(batch_id, "manual-before-next-download")
+    if delete_after_upload:
+        remove_batch_dir(active)
+
+
 def stage_has_space(output_dir: Path, local_budget_gb: float, min_free_gb: float) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     usage = shutil.disk_usage(output_dir)
@@ -1118,6 +1154,9 @@ def command_download(args: argparse.Namespace) -> int:
     state_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
     db = StateDB(state_dir / "openneuro_planb.sqlite3")
+
+    if args.auto_mark_previous_uploaded and not args.upload_command:
+        finalize_previous_manual_batch(db, args.delete_after_upload)
 
     stage_has_space(args.output_dir, args.local_budget_gb, args.min_free_gb)
     datasets = select_datasets(args)
@@ -1335,6 +1374,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Parallel object downloads inside one batch. Each object is written by only one worker.",
     )
     dl.add_argument("--max-batches", type=int, default=1, help="0 means run until all pending objects finish")
+    dl.add_argument(
+        "--auto-mark-previous-uploaded",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Manual-upload mode convenience. When a previous batch is fully downloaded "
+            "and no --upload-command is configured, the next download run assumes the "
+            "operator has uploaded it, marks it uploaded, and removes its local batch dir "
+            "when --delete-after-upload is enabled."
+        ),
+    )
     dl.add_argument(
         "--upload-command",
         default=None,

@@ -22,6 +22,7 @@ PLANB_TRANSFER_BACKEND="${PLANB_TRANSFER_BACKEND:-auto}"
 PLANB_BACKEND_PROBE_MB="${PLANB_BACKEND_PROBE_MB:-256}"
 PLANB_OBJECT_CHUNK_MB="${PLANB_OBJECT_CHUNK_MB:-512}"
 PLANB_RETRIES="${PLANB_RETRIES:-5}"
+PLANB_AUTO_MARK_PREVIOUS_UPLOADED="${PLANB_AUTO_MARK_PREVIOUS_UPLOADED:-true}"
 
 for arg in "$@"; do
   if [[ "$arg" == "--no-install" || "$arg" == "--help" || "$arg" == "-h" ]]; then
@@ -176,6 +177,13 @@ if [[ "$SUBCOMMAND" == "download" ]]; then
   if ! has_arg "--max-batches" "$@"; then
     EXTRA_ARGS+=(--max-batches "$PLANB_MAX_BATCHES")
   fi
+  if ! has_arg "--auto-mark-previous-uploaded" "$@" && ! has_arg "--no-auto-mark-previous-uploaded" "$@"; then
+    if is_truthy "$PLANB_AUTO_MARK_PREVIOUS_UPLOADED"; then
+      EXTRA_ARGS+=(--auto-mark-previous-uploaded)
+    else
+      EXTRA_ARGS+=(--no-auto-mark-previous-uploaded)
+    fi
+  fi
   if [[ -n "$UPLOAD_COMMAND" ]] && ! has_arg "--upload-command" "$@"; then
     EXTRA_ARGS+=(--upload-command "$UPLOAD_COMMAND")
   fi
@@ -190,6 +198,7 @@ if [[ "$SUBCOMMAND" == "download" ]]; then
   echo "[RUN] log_dir=$LOG_DIR"
   echo "[RUN] continuous=$PLANB_CONTINUOUS max_batches=${PLANB_MAX_BATCHES}"
   echo "[RUN] backend=$PLANB_TRANSFER_BACKEND workers=$PLANB_MAX_WORKERS batch_target_gb=$PLANB_BATCH_TARGET_GB"
+  echo "[RUN] auto_mark_previous_uploaded=$PLANB_AUTO_MARK_PREVIOUS_UPLOADED"
 
   exec "$PYTHON_BIN" "$SCRIPT_DIR/download_OpenNeuro_planb.py" \
     download \

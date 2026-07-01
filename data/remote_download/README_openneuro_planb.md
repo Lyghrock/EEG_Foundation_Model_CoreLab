@@ -36,9 +36,11 @@ Interpretation:
 
 ## 2. Default Manual-Upload Batch Download
 
-The default mode downloads one bounded object batch and then stops. You upload
-the printed `batch_dir` yourself, then mark the batch uploaded. The next run
-continues with the next batch.
+The default mode downloads one bounded object batch and then stops. Upload the
+printed `batch_dir` manually. After the upload is complete, run the same
+`download` command again: it first marks the previous downloaded batch as
+uploaded, removes that local batch directory, and then continues with the next
+batch.
 
 Each object is downloaded with S3 byte ranges, so an interrupted large file
 continues from its existing `.part` file in 512 MB chunks by default.
@@ -62,6 +64,7 @@ PLANB_OBJECT_CHUNK_MB=512
 PLANB_RETRIES=5
 PLANB_MAX_BATCHES=1
 PLANB_CONTINUOUS=false
+PLANB_AUTO_MARK_PREVIOUS_UPLOADED=true
 ```
 
 Run one batch:
@@ -70,6 +73,22 @@ Run one batch:
 cd data/remote_download
 ./run_OpenNeuro_planb.sh download
 ```
+
+After the command stops, upload the printed batch directory:
+
+```text
+./openneuro_planb_stage/batch_000001
+```
+
+After that upload has finished, run the same command again:
+
+```bash
+./run_OpenNeuro_planb.sh download
+```
+
+On this second run, `batch_000001` is marked uploaded and removed locally before
+`batch_000002` starts. Repeat this cycle until the script prints `[DONE] no
+pending objects remain`.
 
 Run one batch for a specific dataset:
 
@@ -88,12 +107,11 @@ bash data/remote_download/run_OpenNeuro_planb.sh download \
   --max-workers 1
 ```
 
-Upload the printed `batch_dir` manually. Then mark it uploaded:
+If you ever need to disable the automatic mark-and-clean step because the
+previous batch has not actually been uploaded yet:
 
 ```bash
-./run_OpenNeuro_planb.sh mark-uploaded \
-  --batch-id batch_YYYYMMDD_HHMMSS \
-  --delete-after-upload
+PLANB_AUTO_MARK_PREVIOUS_UPLOADED=false ./run_OpenNeuro_planb.sh download
 ```
 
 ## 4. Status
