@@ -28,6 +28,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from urllib.error import URLError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -264,6 +265,8 @@ def read_dataset_file(path: Path) -> list[Dataset]:
 def select_datasets(args: argparse.Namespace) -> list[Dataset]:
     if args.datasets_file:
         datasets = read_dataset_file(args.datasets_file)
+    elif args.dataset:
+        datasets = [Dataset(ds_id, f"[manual] {ds_id}", 0) for ds_id in args.dataset]
     else:
         print("[DISCOVER] querying OpenNeuro modality=EEG")
         datasets = fetch_openneuro_eeg()
@@ -540,7 +543,14 @@ def list_dataset_objects(dataset_id: str) -> list[S3Object]:
         if token:
             params["continuation-token"] = token
         url = f"https://s3.amazonaws.com/{OPENNEURO_BUCKET}?{urlencode(params)}"
-        raw = http_request(url, timeout=300)
+        try:
+            raw = http_request(url, timeout=300)
+        except URLError as exc:
+            raise RuntimeError(
+                f"Cannot reach OpenNeuro S3 while listing {dataset_id}: {exc}. "
+                "Check HTTPS egress/proxy first, for example: "
+                "curl -I https://s3.amazonaws.com/openneuro.org/"
+            ) from exc
         root = ET.fromstring(raw)
         for item in root.findall(".//{*}Contents"):
             key = item.findtext("{*}Key") or ""
@@ -575,7 +585,10 @@ def build_manifest(db: StateDB, datasets: list[Dataset], refresh: bool) -> None:
         print(f"[MANIFEST] existing state counts: {counts_before}; use --refresh-manifest to relist")
         return
     for ds in datasets:
-        objects = list_dataset_objects(ds.id)
+        try:
+            objects = list_dataset_objects(ds.id)
+        except RuntimeError as exc:
+            raise SystemExit(f"[ERROR] {exc}") from exc
         db.upsert_objects(objects)
     print(f"[MANIFEST] state counts: {db.object_counts()}")
 

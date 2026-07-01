@@ -3,13 +3,14 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
-PLANB_RUNTIME_DIR="${PLANB_RUNTIME_DIR:-$PWD/.openneuro_planb_runtime}"
+PLANB_BASE_DIR="${PLANB_BASE_DIR:-$HOME/openneuro_planb}"
+PLANB_RUNTIME_DIR="${PLANB_RUNTIME_DIR:-$PLANB_BASE_DIR/runtime}"
 PLANB_VENV_DIR="${PLANB_VENV_DIR:-$PLANB_RUNTIME_DIR/venv}"
-PLANB_INSTALL_AWSCLI="${PLANB_INSTALL_AWSCLI:-true}"
+PLANB_INSTALL_AWSCLI="${PLANB_INSTALL_AWSCLI:-auto}"
 
-OUTPUT_DIR="${OUTPUT_DIR:-$PWD/openneuro_planb_stage}"
-STATE_DIR="${STATE_DIR:-$PWD/openneuro_planb_state}"
-LOG_DIR="${LOG_DIR:-$PWD/openneuro_planb_logs}"
+OUTPUT_DIR="${OUTPUT_DIR:-$PLANB_BASE_DIR/stage}"
+STATE_DIR="${STATE_DIR:-$PLANB_BASE_DIR/state}"
+LOG_DIR="${LOG_DIR:-$PLANB_BASE_DIR/logs}"
 UPLOAD_COMMAND="${UPLOAD_COMMAND:-}"
 PLANB_CONTINUOUS="${PLANB_CONTINUOUS:-true}"
 PLANB_MAX_BATCHES="${PLANB_MAX_BATCHES:-0}"
@@ -33,6 +34,16 @@ case "${1:-download}" in
     ;;
 esac
 
+SUBCOMMAND="${1:-download}"
+case "$SUBCOMMAND" in
+  download|speed-test|status|mark-uploaded)
+    shift || true
+    ;;
+  *)
+    SUBCOMMAND="download"
+    ;;
+esac
+
 "$PYTHON_BIN" - <<'PY'
 import sys
 if sys.version_info < (3, 10):
@@ -40,22 +51,28 @@ if sys.version_info < (3, 10):
 print(f"Python {sys.version.split()[0]} OK")
 PY
 
-mkdir -p "$OUTPUT_DIR" "$STATE_DIR" "$LOG_DIR"
-
-LOCK_FILE="$STATE_DIR/openneuro_planb.lock"
-LOCK_DIR="$STATE_DIR/openneuro_planb.lockdir"
-if command -v flock >/dev/null 2>&1; then
-  exec 9>"$LOCK_FILE"
-  if ! flock -n 9; then
-    echo "[LOCK] another OpenNeuro PlanB run is already active for STATE_DIR=$STATE_DIR"
-    exit 9
-  fi
+if [[ "$SUBCOMMAND" == "download" ]]; then
+  mkdir -p "$OUTPUT_DIR" "$STATE_DIR" "$LOG_DIR"
 else
-  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-    echo "[LOCK] another OpenNeuro PlanB run is already active for STATE_DIR=$STATE_DIR"
-    exit 9
+  mkdir -p "$STATE_DIR" "$LOG_DIR"
+fi
+
+if [[ "$SUBCOMMAND" == "download" || "$SUBCOMMAND" == "mark-uploaded" ]]; then
+  LOCK_FILE="$STATE_DIR/openneuro_planb.lock"
+  LOCK_DIR="$STATE_DIR/openneuro_planb.lockdir"
+  if command -v flock >/dev/null 2>&1; then
+    exec 9>"$LOCK_FILE"
+    if ! flock -n 9; then
+      echo "[LOCK] another OpenNeuro PlanB run is already active for STATE_DIR=$STATE_DIR"
+      exit 9
+    fi
+  else
+    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+      echo "[LOCK] another OpenNeuro PlanB run is already active for STATE_DIR=$STATE_DIR"
+      exit 9
+    fi
+    trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
   fi
-  trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
 fi
 
 have_awscli() {
@@ -73,6 +90,15 @@ try_install_awscli() {
   fi
 
   mkdir -p "$PLANB_RUNTIME_DIR"
+  fail_marker="$PLANB_RUNTIME_DIR/awscli_install_failed.marker"
+  if [[ "$PLANB_INSTALL_AWSCLI" == "auto" && -f "$fail_marker" ]]; then
+    marker_age=$(( $(date +%s) - $(stat -c %Y "$fail_marker" 2>/dev/null || echo 0) ))
+    if [[ "$marker_age" -lt 21600 ]]; then
+      echo "[DEPS] recent awscli install failure marker exists; skipping retry for now"
+      echo "       Remove $fail_marker or set PLANB_INSTALL_AWSCLI=true to force retry."
+      return 0
+    fi
+  fi
   echo "[DEPS] awscli not found; trying local venv install under $PLANB_VENV_DIR"
   if "$PYTHON_BIN" -m venv "$PLANB_VENV_DIR" >/dev/null 2>&1; then
     PYTHON_BIN="$PLANB_VENV_DIR/bin/python"
@@ -89,22 +115,19 @@ try_install_awscli() {
   if "$PYTHON_BIN" -m pip install --user --upgrade awscli; then
     export PATH="$HOME/.local/bin:$PATH"
     echo "[DEPS] awscli installed with --user pip"
+    rm -f "$fail_marker"
   else
+    touch "$fail_marker"
     echo "[DEPS] awscli install failed; continuing with urllib/curl fallback"
   fi
 }
 
 try_install_awscli
 
-SUBCOMMAND="${1:-download}"
-case "$SUBCOMMAND" in
-  download|speed-test|status|mark-uploaded)
-    shift || true
-    ;;
-  *)
-    SUBCOMMAND="download"
-    ;;
-esac
+PY_COMMON_ARGS=(--state-dir "$STATE_DIR" --log-dir "$LOG_DIR")
+if ! have_awscli; then
+  PY_COMMON_ARGS+=(--no-install)
+fi
 
 has_arg() {
   local needle="$1"
@@ -171,14 +194,12 @@ if [[ "$SUBCOMMAND" == "download" ]]; then
   exec "$PYTHON_BIN" "$SCRIPT_DIR/download_OpenNeuro_planb.py" \
     download \
     --output-dir "$OUTPUT_DIR" \
-    --state-dir "$STATE_DIR" \
-    --log-dir "$LOG_DIR" \
+    "${PY_COMMON_ARGS[@]}" \
     "${EXTRA_ARGS[@]}" \
     "$@"
 else
   exec "$PYTHON_BIN" "$SCRIPT_DIR/download_OpenNeuro_planb.py" \
     "$SUBCOMMAND" \
-    --state-dir "$STATE_DIR" \
-    --log-dir "$LOG_DIR" \
+    "${PY_COMMON_ARGS[@]}" \
     "$@"
 fi
