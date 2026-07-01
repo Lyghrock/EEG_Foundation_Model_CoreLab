@@ -21,6 +21,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import random
 import shlex
 import shutil
 import sqlite3
@@ -694,6 +695,102 @@ def write_batch_sidecar(batch: sqlite3.Row, objects: list[S3Object]) -> None:
     )
 
 
+def sample_file_check(path: Path) -> dict[str, Any]:
+    item: dict[str, Any] = {
+        "path": str(path),
+        "size": path.stat().st_size,
+        "suffix": path.suffix.lower(),
+        "ok": True,
+        "kind": "binary",
+    }
+    try:
+        head = path.read_bytes()[:4096]
+    except OSError as exc:
+        item.update({"ok": False, "error": str(exc)})
+        return item
+    if not head and item["size"] > 0:
+        item.update({"ok": False, "error": "could not read file head"})
+        return item
+    if item["suffix"] == ".json":
+        item["kind"] = "json"
+        try:
+            json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            item.update({"ok": False, "error": f"json parse failed: {exc}"})
+    elif item["suffix"] in {".tsv", ".csv", ".txt", ".bval", ".bvec"}:
+        item["kind"] = "text"
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+            first_line = text.splitlines()[0] if text.splitlines() else ""
+            item["first_line"] = first_line[:200]
+        except Exception as exc:
+            item.update({"ok": False, "error": f"text read failed: {exc}"})
+    else:
+        item["head_hex"] = head[:16].hex()
+    return item
+
+
+def scan_batch_quality(batch: sqlite3.Row, objects: list[S3Object], sample_n: int = 30) -> Path:
+    batch_dir = Path(batch["batch_dir"])
+    sidecar_dir = batch_dir / "_planb_manifests"
+    sidecar_dir.mkdir(parents=True, exist_ok=True)
+    files = [
+        p for p in batch_dir.rglob("*")
+        if p.is_file() and "_planb_manifests" not in p.parts
+    ]
+    total_size = sum(p.stat().st_size for p in files)
+    ext_counts: dict[str, int] = {}
+    ext_bytes: dict[str, int] = {}
+    for path in files:
+        suffix = path.suffix.lower() or "<none>"
+        size = path.stat().st_size
+        ext_counts[suffix] = ext_counts.get(suffix, 0) + 1
+        ext_bytes[suffix] = ext_bytes.get(suffix, 0) + size
+
+    rng = random.Random(batch["batch_id"])
+    sample_paths = files[:]
+    rng.shuffle(sample_paths)
+    samples = [sample_file_check(p) for p in sample_paths[:sample_n]]
+    missing = []
+    size_mismatch = []
+    for obj in objects:
+        path = local_path_for_key(batch_dir, obj.key)
+        if not path.exists():
+            missing.append(obj.key)
+        elif path.stat().st_size != obj.size:
+            size_mismatch.append(
+                {"key": obj.key, "local": path.stat().st_size, "expected": obj.size}
+            )
+
+    report = {
+        "batch_id": batch["batch_id"],
+        "generated_at": utc_now(),
+        "object_count_manifest": len(objects),
+        "file_count_local": len(files),
+        "total_size_manifest": sum(o.size for o in objects),
+        "total_size_local": total_size,
+        "total_size_local_human": human_bytes(total_size),
+        "extension_counts": dict(sorted(ext_counts.items(), key=lambda x: (-x[1], x[0]))),
+        "extension_bytes": dict(sorted(ext_bytes.items(), key=lambda x: (-x[1], x[0]))),
+        "missing_objects": missing[:100],
+        "missing_object_count": len(missing),
+        "size_mismatch": size_mismatch[:100],
+        "size_mismatch_count": len(size_mismatch),
+        "sample_checks": samples,
+        "sample_error_count": sum(1 for item in samples if not item.get("ok")),
+    }
+    report_path = sidecar_dir / f"quality_report_{batch['batch_id']}.json"
+    report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(
+        f"[QUALITY] {batch['batch_id']}: {len(files)} files, "
+        f"{human_bytes(total_size)}, samples={len(samples)}, "
+        f"sample_errors={report['sample_error_count']}, "
+        f"missing={len(missing)}, mismatch={len(size_mismatch)}"
+    )
+    print(f"[QUALITY] report: {report_path}")
+    return report_path
+
+
 def download_batch(
     db: StateDB,
     batch: sqlite3.Row,
@@ -725,6 +822,7 @@ def download_batch(
         print(f"[BATCH] {batch_id}: failed {len(failures)} objects")
         db.set_batch_status(batch_id, "download_failed")
         return False
+    scan_batch_quality(batch, objects)
     db.set_batch_status(batch_id, "downloaded")
     return True
 

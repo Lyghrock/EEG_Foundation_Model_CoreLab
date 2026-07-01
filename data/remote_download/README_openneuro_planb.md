@@ -29,6 +29,9 @@ The script downloads object batches, uploads each batch, marks its objects as
 uploaded in SQLite, then deletes local batch files.
 Each object is downloaded with S3 byte ranges, so an interrupted large file
 continues from its existing `.part` file in 512 MB chunks by default.
+Before upload, each batch also writes `_planb_manifests/quality_report_*.json`
+with file counts, total size, extension statistics, and sampled JSON/TSV/binary
+read checks.
 
 Example with `rclone`:
 
