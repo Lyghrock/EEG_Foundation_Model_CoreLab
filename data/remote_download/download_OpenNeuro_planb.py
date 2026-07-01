@@ -74,6 +74,14 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def emit(message: str, log_path: Path | None = None) -> None:
+    print(message)
+    if log_path is not None:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(f"{utc_now()} {message}\n")
+
+
 def human_bytes(num: float) -> str:
     value = float(num)
     for unit in ["B", "KB", "MB", "GB", "TB"]:
@@ -175,6 +183,37 @@ def http_request(
     )
     with urlopen(request, timeout=timeout) as response:
         return response.read()
+
+
+def http_request_retry(
+    url: str,
+    *,
+    method: str = "GET",
+    data: bytes | None = None,
+    headers: dict[str, str] | None = None,
+    timeout: int = 300,
+    retries: int = 8,
+    label: str = "request",
+    log_path: Path | None = None,
+) -> bytes:
+    last_error: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            return http_request(
+                url,
+                method=method,
+                data=data,
+                headers=headers,
+                timeout=timeout,
+            )
+        except (TimeoutError, URLError, OSError) as exc:
+            last_error = exc
+            if attempt >= retries:
+                break
+            wait = min(120.0, 2.0 * attempt * attempt)
+            emit(f"[WARN] {label} failed ({attempt}/{retries}): {exc}; retry in {wait:.1f}s", log_path)
+            time.sleep(wait)
+    raise RuntimeError(f"{label} failed after {retries} attempts: {last_error}")
 
 
 def query_graphql(query: str, retries: int = 5, timeout: int = 60) -> dict[str, Any]:
@@ -323,11 +362,39 @@ class StateDB:
                 uploaded_at text,
                 upload_command text
             );
+            create table if not exists manifest_progress (
+                dataset text primary key,
+                status text not null,
+                object_count integer not null default 0,
+                total_size integer not null default 0,
+                page_count integer not null default 0,
+                last_key text,
+                continuation_token text,
+                updated_at text not null,
+                error text
+            );
             """
         )
+        self.ensure_manifest_progress_columns()
         self.conn.commit()
 
+    def ensure_manifest_progress_columns(self) -> None:
+        columns = {
+            row[1]
+            for row in self.conn.execute("pragma table_info(manifest_progress)").fetchall()
+        }
+        migrations = {
+            "page_count": "alter table manifest_progress add column page_count integer not null default 0",
+            "last_key": "alter table manifest_progress add column last_key text",
+            "continuation_token": "alter table manifest_progress add column continuation_token text",
+        }
+        for column, sql in migrations.items():
+            if column not in columns:
+                self.conn.execute(sql)
+
     def upsert_objects(self, objects: list[S3Object]) -> None:
+        if not objects:
+            return
         rows = [
             (
                 obj.key,
@@ -360,6 +427,91 @@ class StateDB:
             "select status, count(*) as n from objects group by status"
         ).fetchall()
         return {row["status"]: int(row["n"]) for row in rows}
+
+    def manifest_progress(self) -> dict[str, sqlite3.Row]:
+        rows = self.conn.execute("select * from manifest_progress").fetchall()
+        return {str(row["dataset"]): row for row in rows}
+
+    def manifest_dataset_progress(self, dataset: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "select * from manifest_progress where dataset=?",
+            (dataset,),
+        ).fetchone()
+
+    def reset_manifest_dataset(self, dataset: str) -> None:
+        now = utc_now()
+        self.conn.execute(
+            """
+            insert into manifest_progress(dataset, status, object_count, total_size,
+                                          page_count, last_key, continuation_token,
+                                          updated_at, error)
+            values(?, 'pending', 0, 0, 0, null, null, ?, null)
+            on conflict(dataset) do update set
+                status='pending',
+                object_count=0,
+                total_size=0,
+                page_count=0,
+                last_key=null,
+                continuation_token=null,
+                updated_at=excluded.updated_at,
+                error=null
+            """,
+            (dataset, now),
+        )
+        self.conn.commit()
+
+    def set_manifest_dataset_status(
+        self,
+        dataset: str,
+        status: str,
+        object_count: int | None = None,
+        total_size: int | None = None,
+        page_count: int | None = None,
+        last_key: str | None = None,
+        continuation_token: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        now = utc_now()
+        current = self.manifest_dataset_progress(dataset)
+        if object_count is None:
+            object_count = int(current["object_count"]) if current else 0
+        if total_size is None:
+            total_size = int(current["total_size"]) if current else 0
+        if page_count is None:
+            page_count = int(current["page_count"]) if current else 0
+        if last_key is None and current:
+            last_key = current["last_key"]
+        if continuation_token is None and current:
+            continuation_token = current["continuation_token"]
+        self.conn.execute(
+            """
+            insert into manifest_progress(dataset, status, object_count, total_size,
+                                          page_count, last_key, continuation_token,
+                                          updated_at, error)
+            values(?, ?, ?, ?, ?, ?, ?, ?, ?)
+            on conflict(dataset) do update set
+                status=excluded.status,
+                object_count=excluded.object_count,
+                total_size=excluded.total_size,
+                page_count=excluded.page_count,
+                last_key=excluded.last_key,
+                continuation_token=excluded.continuation_token,
+                updated_at=excluded.updated_at,
+                error=excluded.error
+            """,
+            (
+                dataset,
+                status,
+                object_count,
+                total_size,
+                page_count,
+                last_key,
+                continuation_token,
+                now,
+                error,
+            ),
+        )
+        self.conn.commit()
 
     def pending_count(self) -> int:
         return int(
@@ -550,49 +702,114 @@ class StateDB:
         return manifest_path
 
 
+def listing_log_path(log_dir: Path | None, dataset_id: str) -> Path | None:
+    if log_dir is None:
+        return None
+    safe_name = dataset_id.replace("/", "_")
+    return log_dir / "listing" / f"{safe_name}.list.log"
+
+
+def fetch_s3_listing_page(
+    dataset_id: str,
+    prefix: str,
+    page_index: int,
+    *,
+    start_after: str | None = None,
+    continuation_token: str | None = None,
+    log_path: Path | None = None,
+) -> tuple[list[S3Object], bool, str | None]:
+    params = {
+        "list-type": "2",
+        "prefix": prefix,
+        "max-keys": "1000",
+    }
+    if continuation_token:
+        params["continuation-token"] = continuation_token
+    elif start_after:
+        params["start-after"] = start_after
+    url = f"https://s3.amazonaws.com/{OPENNEURO_BUCKET}?{urlencode(params)}"
+    root: ET.Element | None = None
+    last_error: Exception | None = None
+    for parse_attempt in range(1, 4):
+        try:
+            raw = http_request_retry(
+                url,
+                timeout=300,
+                retries=10,
+                label=f"S3 list {dataset_id} page {page_index}",
+                log_path=log_path,
+            )
+            root = ET.fromstring(raw)
+            break
+        except (RuntimeError, ET.ParseError) as exc:
+            last_error = exc
+            if parse_attempt >= 3:
+                break
+            wait = min(60.0, 5.0 * parse_attempt)
+            emit(
+                f"[WARN] S3 list {dataset_id} page {page_index} parse/read failed "
+                f"({parse_attempt}/3): {exc}; retry in {wait:.1f}s",
+                log_path,
+            )
+            time.sleep(wait)
+    if root is None:
+        raise RuntimeError(
+            f"Cannot read OpenNeuro S3 listing page for {dataset_id}: {last_error}. "
+            "Check HTTPS egress/proxy first, for example: "
+            "curl -I https://s3.amazonaws.com/openneuro.org/"
+        )
+
+    page_objects: list[S3Object] = []
+    for item in root.findall(".//{*}Contents"):
+        key = item.findtext("{*}Key") or ""
+        size_text = item.findtext("{*}Size") or "0"
+        size = int(size_text)
+        if key.endswith("/") or size == 0:
+            continue
+        page_objects.append(
+            S3Object(
+                dataset=dataset_id,
+                key=key,
+                size=size,
+                etag=(item.findtext("{*}ETag") or "").strip('"'),
+                last_modified=item.findtext("{*}LastModified") or "",
+            )
+        )
+    is_truncated = (root.findtext(".//{*}IsTruncated") or "").lower() == "true"
+    next_token = root.findtext(".//{*}NextContinuationToken")
+    if is_truncated and not page_objects and not next_token:
+        raise RuntimeError(
+            f"S3 listing for {dataset_id} page {page_index} is truncated but returned "
+            "neither objects nor NextContinuationToken"
+        )
+    return page_objects, is_truncated, next_token
+
+
 def list_dataset_objects(dataset_id: str) -> list[S3Object]:
     prefix = dataset_id.rstrip("/") + "/"
-    token: str | None = None
+    continuation_token: str | None = None
+    start_after: str | None = None
     objects: list[S3Object] = []
+    page_index = 0
     print(f"[LIST] {dataset_id}: listing https://s3.amazonaws.com/{OPENNEURO_BUCKET}/{prefix}")
     while True:
-        params = {
-            "list-type": "2",
-            "prefix": prefix,
-            "max-keys": "1000",
-        }
-        if token:
-            params["continuation-token"] = token
-        url = f"https://s3.amazonaws.com/{OPENNEURO_BUCKET}?{urlencode(params)}"
-        try:
-            raw = http_request(url, timeout=300)
-        except URLError as exc:
-            raise RuntimeError(
-                f"Cannot reach OpenNeuro S3 while listing {dataset_id}: {exc}. "
-                "Check HTTPS egress/proxy first, for example: "
-                "curl -I https://s3.amazonaws.com/openneuro.org/"
-            ) from exc
-        root = ET.fromstring(raw)
-        for item in root.findall(".//{*}Contents"):
-            key = item.findtext("{*}Key") or ""
-            size_text = item.findtext("{*}Size") or "0"
-            size = int(size_text)
-            if key.endswith("/") or size == 0:
-                continue
-            objects.append(
-                S3Object(
-                    dataset=dataset_id,
-                    key=key,
-                    size=size,
-                    etag=(item.findtext("{*}ETag") or "").strip('"'),
-                    last_modified=item.findtext("{*}LastModified") or "",
-                )
-            )
-        is_truncated = (root.findtext(".//{*}IsTruncated") or "").lower() == "true"
+        page_index += 1
+        page_objects, is_truncated, next_token = fetch_s3_listing_page(
+            dataset_id,
+            prefix,
+            page_index,
+            start_after=start_after,
+            continuation_token=continuation_token,
+        )
+        objects.extend(page_objects)
         if not is_truncated:
             break
-        token = root.findtext(".//{*}NextContinuationToken")
-        if not token:
+        if page_objects:
+            start_after = page_objects[-1].key
+            continuation_token = None
+        else:
+            continuation_token = next_token
+        if not start_after and not continuation_token:
             break
         if len(objects) % 10000 < 1000:
             print(f"[LIST] {dataset_id}: {len(objects)} objects so far")
@@ -600,17 +817,180 @@ def list_dataset_objects(dataset_id: str) -> list[S3Object]:
     return objects
 
 
-def build_manifest(db: StateDB, datasets: list[Dataset], refresh: bool) -> None:
-    counts_before = db.object_counts()
-    if counts_before and not refresh:
-        print(f"[MANIFEST] existing state counts: {counts_before}; use --refresh-manifest to relist")
-        return
-    for ds in datasets:
+def list_dataset_objects_to_db(
+    db: StateDB,
+    dataset_id: str,
+    log_dir: Path,
+    *,
+    refresh: bool = False,
+) -> tuple[int, int]:
+    prefix = dataset_id.rstrip("/") + "/"
+    log_path = listing_log_path(log_dir, dataset_id)
+    if refresh:
+        db.reset_manifest_dataset(dataset_id)
+    row = db.manifest_dataset_progress(dataset_id)
+    if row and row["status"] == "listed" and not refresh:
+        object_count = int(row["object_count"])
+        total_size = int(row["total_size"])
+        emit(
+            f"[LIST] {dataset_id}: already complete "
+            f"({object_count} objects, {human_bytes(total_size)})",
+            log_path,
+        )
+        return object_count, total_size
+
+    object_count = int(row["object_count"]) if row else 0
+    total_size = int(row["total_size"]) if row else 0
+    page_count = int(row["page_count"]) if row else 0
+    start_after = str(row["last_key"]) if row and row["last_key"] else None
+    continuation_token = (
+        str(row["continuation_token"])
+        if row and row["continuation_token"] and not start_after
+        else None
+    )
+    resume_msg = (
+        f"; resume page={page_count + 1}, objects={object_count}, "
+        f"size={human_bytes(total_size)}, last_key={start_after}"
+        if start_after or continuation_token or object_count
+        else ""
+    )
+    emit(
+        f"[LIST] {dataset_id}: listing https://s3.amazonaws.com/{OPENNEURO_BUCKET}/{prefix}{resume_msg}",
+        log_path,
+    )
+    db.set_manifest_dataset_status(
+        dataset_id,
+        "listing",
+        object_count=object_count,
+        total_size=total_size,
+        page_count=page_count,
+        last_key=start_after,
+        continuation_token=continuation_token,
+        error=None,
+    )
+
+    while True:
+        page_index = page_count + 1
         try:
-            objects = list_dataset_objects(ds.id)
+            page_objects, is_truncated, next_token = fetch_s3_listing_page(
+                dataset_id,
+                prefix,
+                page_index,
+                start_after=start_after,
+                continuation_token=continuation_token,
+                log_path=log_path,
+            )
         except RuntimeError as exc:
+            db.set_manifest_dataset_status(
+                dataset_id,
+                "failed",
+                object_count=object_count,
+                total_size=total_size,
+                page_count=page_count,
+                last_key=start_after,
+                continuation_token=continuation_token,
+                error=str(exc),
+            )
+            emit(f"[ERROR] {dataset_id}: listing failed at page {page_index}: {exc}", log_path)
+            raise
+
+        db.upsert_objects(page_objects)
+        page_count = page_index
+        object_count += len(page_objects)
+        total_size += sum(obj.size for obj in page_objects)
+        if page_objects:
+            start_after = page_objects[-1].key
+            continuation_token = None
+        else:
+            continuation_token = next_token
+
+        db.set_manifest_dataset_status(
+            dataset_id,
+            "listing",
+            object_count=object_count,
+            total_size=total_size,
+            page_count=page_count,
+            last_key=start_after,
+            continuation_token=continuation_token if is_truncated else "",
+            error=None,
+        )
+        emit(
+            f"[LIST] {dataset_id}: page {page_count} saved; "
+            f"+{len(page_objects)} objects, total {object_count}, {human_bytes(total_size)}",
+            log_path,
+        )
+
+        if not is_truncated:
+            db.set_manifest_dataset_status(
+                dataset_id,
+                "listed",
+                object_count=object_count,
+                total_size=total_size,
+                page_count=page_count,
+                last_key=start_after,
+                continuation_token="",
+                error=None,
+            )
+            emit(
+                f"[LIST] {dataset_id}: complete; {object_count} objects, {human_bytes(total_size)}",
+                log_path,
+            )
+            return object_count, total_size
+
+        if not start_after and not continuation_token:
+            error = "truncated listing did not return a resumable last_key or continuation token"
+            db.set_manifest_dataset_status(
+                dataset_id,
+                "failed",
+                object_count=object_count,
+                total_size=total_size,
+                page_count=page_count,
+                last_key=start_after,
+                continuation_token=continuation_token,
+                error=error,
+            )
+            emit(f"[ERROR] {dataset_id}: {error}", log_path)
+            raise RuntimeError(error)
+
+
+def build_manifest(db: StateDB, datasets: list[Dataset], refresh: bool, log_dir: Path) -> None:
+    counts_before = db.object_counts()
+    dataset_ids = [ds.id for ds in datasets]
+    progress = db.manifest_progress()
+    completed = {
+        dataset_id
+        for dataset_id in dataset_ids
+        if dataset_id in progress and progress[dataset_id]["status"] == "listed"
+    }
+    if counts_before and not refresh and len(completed) == len(dataset_ids):
+        print(f"[MANIFEST] existing complete state counts: {counts_before}; use --refresh-manifest to relist")
+        return
+    if counts_before and not refresh:
+        print(
+            f"[MANIFEST] partial state counts: {counts_before}; "
+            f"{len(completed)}/{len(dataset_ids)} datasets listed; continuing missing datasets"
+        )
+    if refresh:
+        print("[MANIFEST] refresh requested; relisting selected datasets")
+    for ds in datasets:
+        if not refresh and ds.id in completed:
+            row = progress[ds.id]
+            print(
+                f"[MANIFEST] {ds.id}: already listed "
+                f"({int(row['object_count'])} objects, {human_bytes(int(row['total_size']))}); skip"
+            )
+            continue
+        try:
+            object_count, total_size = list_dataset_objects_to_db(
+                db,
+                ds.id,
+                log_dir,
+                refresh=refresh,
+            )
+        except RuntimeError as exc:
+            db.set_manifest_dataset_status(ds.id, "failed", error=str(exc))
             raise SystemExit(f"[ERROR] {exc}") from exc
-        db.upsert_objects(objects)
+        print(f"[MANIFEST] {ds.id}: listed {object_count} objects, {human_bytes(total_size)}")
     print(f"[MANIFEST] state counts: {db.object_counts()}")
 
 
@@ -1147,7 +1527,7 @@ def command_download(args: argparse.Namespace) -> int:
     if len(datasets) > 20:
         print(f"  ... {len(datasets) - 20} more")
 
-    build_manifest(db, datasets, refresh=args.refresh_manifest)
+    build_manifest(db, datasets, refresh=args.refresh_manifest, log_dir=log_dir)
     if args.dry_run:
         max_object_bytes = gb_to_bytes(args.local_budget_gb - args.min_free_gb)
         pending = db.next_objects(
@@ -1257,6 +1637,29 @@ def command_mark_uploaded(args: argparse.Namespace) -> int:
 def command_status(args: argparse.Namespace) -> int:
     db = StateDB(args.state_dir / "openneuro_planb.sqlite3")
     print("[STATE]", db.object_counts())
+    manifest_rows = db.conn.execute(
+        """
+        select dataset, status, object_count, total_size, page_count, last_key, updated_at, error
+        from manifest_progress
+        order by updated_at desc
+        limit 20
+        """
+    ).fetchall()
+    if manifest_rows:
+        print("[MANIFEST]")
+        for row in manifest_rows:
+            last_key = row["last_key"] or ""
+            if len(last_key) > 80:
+                last_key = "..." + last_key[-77:]
+            error = row["error"] or ""
+            if len(error) > 80:
+                error = error[:77] + "..."
+            print(
+                f"{row['dataset']:<10} {row['status']:<8} "
+                f"{int(row['page_count']):>5} pages  "
+                f"{int(row['object_count']):>8} objects  {human_bytes(int(row['total_size'])):>10}  "
+                f"{row['updated_at']}  last_key={last_key}  {error}"
+            )
     rows = db.conn.execute(
         "select batch_id, status, object_count, total_size, batch_dir, updated_at from batches order by created_at desc limit 20"
     ).fetchall()

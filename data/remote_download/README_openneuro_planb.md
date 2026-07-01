@@ -14,6 +14,15 @@ For actual file transfer it can use `awscli`, `urllib`, or `curl`; with
 `--transfer-backend auto` it benchmarks the available backends and uses the
 fastest one for the batch.
 
+S3 listing is treated as a resumable process. Each successfully listed S3 page
+is immediately written to the SQLite state DB, and the last listed key is saved
+so a later run can resume the same dataset instead of starting over. Per-dataset
+listing logs are written under:
+
+```text
+$HOME/openneuro_planb/logs/listing/dsXXXXXX.list.log
+```
+
 ## 1. Speed Test
 
 Run the same command on H100 and on the overseas WSL machine:
