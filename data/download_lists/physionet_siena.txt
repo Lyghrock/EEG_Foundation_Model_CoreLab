@@ -1,1 +1,0 @@
-siena-scalp-eeg/1.0.0  # Siena Scalp EEG Database

@@ -309,12 +309,12 @@ sbatch \
   --max-size-mb 0 \
   --open-access-only \
   --no-auth \
-  --datasets-file "$DATA_DIR/download_lists/physionet_siena.txt" \
+  --dataset siena-scalp-eeg/1.0.0 \
   --sort size
 ```
 
-Challenge 2018-only download uses
-`data/download_lists/physionet_challenge2018.txt` in the same command shape.
+Challenge 2018-only download uses `--dataset challenge-2018/1.0.0` in the same
+command shape.
 
 ## 6. Statistical Validation As `share`
 

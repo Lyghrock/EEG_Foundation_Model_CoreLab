@@ -1,17 +1,23 @@
-# Core HTTP/download dependencies
+# Core HTTP/download dependencies.
 requests>=2.31
-openneuro-py>=2026.4.1
-awscli>=1.33
 tqdm>=4.66
 
-# EEG I/O and preprocessing
+# OpenNeuro transfer backends.
+openneuro-py>=2026.4.1
+awscli>=1.33
+
+# EEG I/O, preprocessing, and statistical analysis.
 mne>=1.8
 numpy>=1.26
 scipy>=1.11
 pandas>=2.0
 matplotlib>=3.8
 
-# Optional readers used by MNE for common EEG container formats
+# Optional EEG/biomedical readers used by MNE or by future validation passes.
+# The current validators parse EDF/BDF/WFDB headers directly where possible,
+# but these packages improve coverage for full reads and preprocessing.
+edfio>=0.4
+pyedflib>=0.1.37
 pymatreader>=1.0
 mffpy>=0.8
 h5py>=3.10

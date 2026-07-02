@@ -353,12 +353,6 @@ PhysioNet/Computing in Cardiology Challenge 2018 sleep arousal dataset:
 challenge-2018/1.0.0
 ```
 
-This repo pins that dataset in:
-
-```text
-data/download_lists/physionet_challenge2018.txt
-```
-
 Because this dataset has been manually verified as EEG-containing PSG data, the
 PhysioNet downloader includes a curated allowlist fallback for
 `challenge-2018/1.0.0` when the metadata page is temporarily unreachable. This
@@ -422,7 +416,6 @@ fi
 
 test -r "$REPO/data/sbatch_download.sh"
 test -r "$REPO/data/download_PhysioNet.py"
-test -r "$REPO/data/download_lists/physionet_challenge2018.txt"
 test -x "$PY"
 test ! -L "$BASE/venv/bin/python3"
 bash -n "$REPO/data/sbatch_download.sh"
@@ -445,14 +438,12 @@ DATA_DIR=$REPO/data
 SLURM_LOG_DIR=$BASE/logs/slurm
 DOWNLOAD_LOG_DIR=$BASE/logs/download
 PHYSIONET_ROOT=$BASE/PhysioNet
-LIST=$DATA_DIR/download_lists/physionet_challenge2018.txt
 
 cd "$DATA_DIR"
 
 test "$(pwd -P)" = "$(cd "$DATA_DIR" && pwd -P)"
 test -r sbatch_download.sh
 test -r download_PhysioNet.py
-test -r "$LIST"
 test -x "$PY"
 bash -n sbatch_download.sh
 bash -n "$REPO/data/statistical_analysis/run_physionet_challenge2018_analysis.sh"
@@ -464,7 +455,7 @@ touch "$SLURM_LOG_DIR/.share_write_test" && rm -f "$SLURM_LOG_DIR/.share_write_t
 touch "$BASE/statistical_reports/.share_write_test" && rm -f "$BASE/statistical_reports/.share_write_test"
 
 "$PY" download_PhysioNet.py \
-  --datasets-file "$LIST" \
+  --dataset challenge-2018/1.0.0 \
   --output-dir "$PHYSIONET_ROOT" \
   --max-workers 1 \
   --max-size-mb 0 \
@@ -486,7 +477,7 @@ if sbatch --help 2>&1 | grep -q -- "--test-only"; then
     --max-workers 1 \
     --max-size-mb 0 \
     --dry-run \
-    --datasets-file "$LIST" \
+    --dataset challenge-2018/1.0.0 \
     --sort size
 fi
 
@@ -503,7 +494,7 @@ DRY_JOB_RAW=$(sbatch --parsable \
   --max-workers 1 \
   --max-size-mb 0 \
   --dry-run \
-  --datasets-file "$LIST" \
+  --dataset challenge-2018/1.0.0 \
   --sort size)
 DRY_JOB=${DRY_JOB_RAW%%;*}
 
@@ -528,7 +519,6 @@ DATA_DIR=$REPO/data
 SLURM_LOG_DIR=$BASE/logs/slurm
 DOWNLOAD_LOG_DIR=$BASE/logs/download
 PHYSIONET_ROOT=$BASE/PhysioNet
-LIST=$DATA_DIR/download_lists/physionet_challenge2018.txt
 
 cd "$DATA_DIR"
 
@@ -544,7 +534,7 @@ JOB_RAW=$(sbatch --parsable \
   --log-dir "$DOWNLOAD_LOG_DIR" \
   --max-workers 1 \
   --max-size-mb 0 \
-  --datasets-file "$LIST" \
+  --dataset challenge-2018/1.0.0 \
   --sort size)
 JOB=${JOB_RAW%%;*}
 

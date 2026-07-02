@@ -356,7 +356,10 @@ select_download_script() {
     case "${DATA_SOURCE}" in
         openneuro)
             DOWNLOAD_SCRIPT="${OPENNEURO_SCRIPT}"
-            REQUIRED_IMPORTS="import mne, openneuro, requests"
+            REQUIRED_IMPORTS="import requests"
+            if is_true "${ENABLE_PREPROCESS}"; then
+                REQUIRED_IMPORTS="${REQUIRED_IMPORTS}; import mne"
+            fi
             ;;
         physionet)
             DOWNLOAD_SCRIPT="${PHYSIONET_SCRIPT}"
