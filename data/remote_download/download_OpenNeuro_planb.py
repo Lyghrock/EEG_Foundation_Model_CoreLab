@@ -53,6 +53,7 @@ DEFAULT_LOG_DIR = Path("openneuro_planb_logs")
 DEFAULT_LOCAL_BUDGET_GB = 280.0
 DEFAULT_BATCH_TARGET_GB = 200.0
 MIN_FREE_GB = 20.0
+TRANSIENT_NETWORK_ERRORS = (TimeoutError, URLError, OSError, HTTPException)
 
 
 @dataclass(frozen=True)
@@ -81,6 +82,33 @@ def emit(message: str, log_path: Path | None = None) -> None:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         with log_path.open("a", encoding="utf-8") as f:
             f.write(f"{utc_now()} {message}\n")
+
+
+def transient_error_summary(exc: BaseException) -> str:
+    if isinstance(exc, URLError) and getattr(exc, "reason", None):
+        return f"{type(exc).__name__}({exc.reason})"
+    return f"{type(exc).__name__}: {exc}"
+
+
+def is_transient_network_error(exc: BaseException) -> bool:
+    if isinstance(exc, TRANSIENT_NETWORK_ERRORS):
+        return True
+    if isinstance(exc, RuntimeError):
+        text = str(exc).lower()
+        transient_markers = [
+            "timed out",
+            "timeout",
+            "connection reset",
+            "connection aborted",
+            "connection refused",
+            "remote end closed",
+            "incomplete read",
+            "temporarily unavailable",
+            "tls",
+            "ssl",
+        ]
+        return any(marker in text for marker in transient_markers)
+    return False
 
 
 def human_bytes(num: float) -> str:
@@ -207,14 +235,21 @@ def http_request_retry(
                 headers=headers,
                 timeout=timeout,
             )
-        except (TimeoutError, URLError, OSError, HTTPException) as exc:
+        except Exception as exc:
+            if not is_transient_network_error(exc):
+                raise
             last_error = exc
             if attempt >= retries:
                 break
             wait = min(120.0, 2.0 * attempt * attempt)
-            emit(f"[WARN] {label} failed ({attempt}/{retries}): {exc}; retry in {wait:.1f}s", log_path)
+            emit(
+                f"[WARN] {label} failed ({attempt}/{retries}): "
+                f"{transient_error_summary(exc)}; retry in {wait:.1f}s",
+                log_path,
+            )
             time.sleep(wait)
-    raise RuntimeError(f"{label} failed after {retries} attempts: {last_error}")
+    detail = transient_error_summary(last_error) if last_error else "unknown error"
+    raise RuntimeError(f"{label} failed after {retries} attempts: {detail}")
 
 
 def query_graphql(query: str, retries: int = 5, timeout: int = 60) -> dict[str, Any]:
@@ -222,12 +257,14 @@ def query_graphql(query: str, retries: int = 5, timeout: int = 60) -> dict[str, 
     for attempt in range(1, retries + 1):
         try:
             body = json.dumps({"query": query}).encode("utf-8")
-            raw = http_request(
+            raw = http_request_retry(
                 GRAPHQL_URL,
                 method="POST",
                 data=body,
                 headers=GRAPHQL_HEADERS,
                 timeout=timeout,
+                retries=1,
+                label="OpenNeuro GraphQL page",
             )
             payload = json.loads(raw.decode("utf-8"))
             if payload.get("errors") and not payload.get("data"):
@@ -1084,8 +1121,14 @@ def download_range_curl(key: str, start: int, end: int, dest: Path, timeout: int
         "--fail",
         "--retry",
         "3",
+        "--retry-all-errors",
+        "--retry-connrefused",
         "--retry-delay",
         "2",
+        "--connect-timeout",
+        "60",
+        "--max-time",
+        str(timeout),
         "--range",
         f"{start}-{end}",
         "-o",
