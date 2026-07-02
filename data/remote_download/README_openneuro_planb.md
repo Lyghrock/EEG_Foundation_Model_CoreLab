@@ -65,7 +65,7 @@ exactly one manually uploaded batch.
 OUTPUT_DIR=./openneuro_planb_stage
 STATE_DIR=$HOME/openneuro_planb/state
 LOG_DIR=$HOME/openneuro_planb/logs
-PLANB_LOCAL_BUDGET_GB=280
+PLANB_LOCAL_BUDGET_GB=230
 PLANB_BATCH_TARGET_GB=200
 PLANB_MIN_FREE_GB=20
 PLANB_MAX_WORKERS=8
