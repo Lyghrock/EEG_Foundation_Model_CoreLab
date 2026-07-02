@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+from http.client import HTTPException
 import json
 import os
 import random
@@ -206,7 +207,7 @@ def http_request_retry(
                 headers=headers,
                 timeout=timeout,
             )
-        except (TimeoutError, URLError, OSError) as exc:
+        except (TimeoutError, URLError, OSError, HTTPException) as exc:
             last_error = exc
             if attempt >= retries:
                 break
